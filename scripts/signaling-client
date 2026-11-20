@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# Simple signaling client for testing the WebSocket server.
+#
+# Usage: signaling-client [HOST:PORT] [COMMAND]
+#   COMMAND: hello, probe, list, create SESSION CMD, inspect SESSION,
+#            resume SESSION, resize SESSION WxH, stop SESSION,
+#            stream-start SESSION, stream-stop SESSION, ping
+set -euo pipefail
+
+HOST="${1:-127.0.0.1:9470}"
+COMMAND="${2:-hello}"
+TOKEN="${ENZREMOTE_AUTH_TOKEN:-test}"
+shift 2 2>/dev/null || true
+
+which websocat >/dev/null 2>&1 || {
+    printf 'websocat is required: https://github.com/vi/websocat\n' >&2
+    exit 1
+}
+
+send_and_receive() {
+    local message="$1"
+    printf '%s\n' "$message" | websocat --text -n1 "ws://$HOST" 2>/dev/null
+}
+
+hello_then_send() {
+    local message="$1"
+    {
+        printf '{"type":"hello","v":1,"device_id":"cli-test","token":"%s"}\n' "$TOKEN"
+        sleep 0.2
+        printf '%s\n' "$message"
+        sleep 0.3
+    } | websocat --text "ws://$HOST" 2>/dev/null | tail -1
+}
+
+case "$COMMAND" in
+    hello)
+        send_and_receive "$(printf '{"type":"hello","v":1,"device_id":"cli-test","token":"%s"}' "$TOKEN")"
+        ;;
+    probe)
+        hello_then_send '{"type":"probe","v":1}'
+        ;;
+    list)
+        hello_then_send '{"type":"session_list","v":1}'
+        ;;
+    create)
+        session_id="${1:?usage: signaling-client HOST create SESSION_ID COMMAND [WxH] [SCALE] [REFRESH]}"
+        app_cmd="${2:?usage: signaling-client HOST create SESSION_ID COMMAND [WxH] [REFRESH]}"
+        dims="${3:-390x844}"
+        width="${dims%%x*}"
+        height="${dims##*x}"
+        scale="${4:-1.0}"
+        refresh="${5:-60}"
+        hello_then_send "{\"type\":\"session_request\",\"v\":1,\"session_id\":\"$session_id\",\"command\":[\"$app_cmd\"],\"width\":$width,\"height\":$height,\"scale\":$scale,\"refresh_hz\":$refresh}"
+        ;;
+    inspect)
+        session_id="${1:?usage: signaling-client HOST inspect SESSION_ID}"
+        hello_then_send "{\"type\":\"session_inspect\",\"v\":1,\"session_id\":\"$session_id\"}"
+        ;;
+    resume)
+        session_id="${1:?usage: signaling-client HOST resume SESSION_ID}"
+        hello_then_send "{\"type\":\"session_resume\",\"v\":1,\"session_id\":\"$session_id\"}"
+        ;;
+    resize)
+        session_id="${1:?usage: signaling-client HOST resize SESSION_ID WxH [SCALE] [REFRESH]}"
+        dims="${2:?usage: signaling-client HOST resize SESSION_ID WxH [SCALE] [REFRESH]}"
+        width="${dims%%x*}"
+        height="${dims##*x}"
+        scale="${3:-1.0}"
+        refresh="${4:-60}"
+        hello_then_send "{\"type\":\"session_resize\",\"v\":1,\"session_id\":\"$session_id\",\"width\":$width,\"height\":$height,\"scale\":$scale,\"refresh_hz\":$refresh}"
+        ;;
+    stop)
+        session_id="${1:?usage: signaling-client HOST stop SESSION_ID}"
+        hello_then_send "{\"type\":\"session_stop\",\"v\":1,\"session_id\":\"$session_id\"}"
+        ;;
+    stream-start)
+        session_id="${1:?usage: signaling-client HOST stream-start SESSION_ID}"
+        hello_then_send "{\"type\":\"stream_start\",\"v\":1,\"session_id\":\"$session_id\"}"
+        ;;
+    stream-stop)
+        session_id="${1:?usage: signaling-client HOST stream-stop SESSION_ID}"
+        hello_then_send "{\"type\":\"stream_stop\",\"v\":1,\"session_id\":\"$session_id\"}"
+        ;;
+    ping)
+        timestamp=$(($(date +%s) * 1000))
+        hello_then_send "{\"type\":\"ping\",\"v\":1,\"timestamp_ms\":$timestamp}"
+        ;;
+    *)
+        printf 'Unknown command: %s\n' "$COMMAND" >&2
+        printf 'Commands: hello, probe, list, create, inspect, resume, resize, stop, stream-start, stream-stop, ping\n' >&2
+        exit 2
+        ;;
+esac

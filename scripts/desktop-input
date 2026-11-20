@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""Translate the media worker's line protocol onto one leased compositor seat."""
+import json
+import math
+import os
+import socket
+import struct
+import sys
+import time
+
+
+class Commands:
+    def __init__(self, width, height):
+        if not 240 <= width <= 4096 or not 240 <= height <= 4096:
+            raise ValueError("viewport")
+        self.width, self.height = width, height
+        self.x, self.y = width / 2, height / 2
+
+    @staticmethod
+    def flag(value):
+        if value not in ("0", "1"):
+            raise ValueError("boolean")
+        return value == "1"
+
+    @staticmethod
+    def number(value):
+        result = float(value)
+        if not math.isfinite(result) or abs(result) > 1_000_000:
+            raise ValueError("coordinate")
+        return result
+
+    def position(self, x, y):
+        self.x = max(0, min(self.width - 1, x))
+        self.y = max(0, min(self.height - 1, y))
+        return {"x": self.x, "y": self.y}
+
+    def decode(self, line):
+        if line.startswith("text "):
+            text = line[5:]
+            if any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in text):
+                raise ValueError("text")
+            return [{"type": "text", "text": text[i:i + 1000]} for i in range(0, len(text), 1000)]
+        fields = line.split()
+        if not fields:
+            raise ValueError("empty")
+        operation, args = fields[0], fields[1:]
+        if operation in ("key", "button") and len(args) == 2:
+            code = int(args[0])
+            if not 0 <= code <= 767:
+                raise ValueError("keycode")
+            return [{"type": operation, operation: code, "pressed": self.flag(args[1])}]
+        if operation == "pointer" and len(args) == 3:
+            position = self.position(self.number(args[0]), self.number(args[1]))
+            return [{"type": "pointer", **position, "click": self.flag(args[2])}]
+        if operation == "pointer_relative" and len(args) == 2:
+            position = self.position(self.x + self.number(args[0]), self.y + self.number(args[1]))
+            return [{"type": "pointer", **position}]
+        if operation == "scroll_pixels" and len(args) == 5:
+            position = self.position(self.number(args[0]), self.number(args[1]))
+            return [{"type": operation, **position, "dx": self.number(args[2]), "dy": self.number(args[3]), "stop": self.flag(args[4])}]
+        if operation == "scroll" and len(args) == 2:
+            return [{"type": "scroll_pixels", "x": self.x, "y": self.y, "dx": self.number(args[0]) * 15, "dy": self.number(args[1]) * 15, "stop": False}]
+        raise ValueError("unsupported command")
+
+
+class Controller:
+    def __init__(self, endpoint, token, pid, bind_input=True):
+        if not endpoint.startswith("/") or len(token) != 32 or any(char not in "0123456789abcdef" for char in token):
+            raise ValueError("endpoint")
+        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.socket.settimeout(2)
+        self.socket.connect(endpoint)
+        peer_pid, peer_uid, _ = struct.unpack("3i", self.socket.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+        if peer_pid != pid or peer_uid != os.getuid():
+            raise ValueError("peer")
+        self.reader = self.socket.makefile("rb")
+        if not bind_input:
+            return
+        response = self.call("input_bind", token=token)
+        deadline = time.monotonic() + 2
+        while not response.get("input_ready"):
+            if time.monotonic() > deadline or not response.get("active"):
+                raise ValueError("input is unavailable")
+            time.sleep(.025)
+            response = self.call("status")
+
+    def call(self, operation, **arguments):
+        self.socket.sendall((json.dumps({"v": 1, "op": operation, **arguments}, ensure_ascii=False) + "\n").encode())
+        line = self.reader.readline(16385)
+        if not line.endswith(b"\n") or len(line) > 16384:
+            raise OSError("reply framing")
+        reply = json.loads(line)
+        if reply.get("ok") is not True:
+            raise ValueError("input rejected")
+        return reply
+
+    def close(self):
+        self.reader.close()
+        self.socket.close()
+
+
+def main():
+    controller = None
+    try:
+        content = len(sys.argv) == 5 and sys.argv[1] == "--content"
+        if not content and len(sys.argv) != 3:
+            raise ValueError("arguments")
+        token = os.environ["ENZREMOTE_DESKTOP_INPUT_TOKEN"]
+        controller = Controller(os.environ["ENZREMOTE_DESKTOP_INPUT_SOCKET"], token, int(os.environ["ENZREMOTE_DESKTOP_PID"]), bind_input=not content)
+        if content:
+            controller.call("content_size", token=token, width=int(sys.argv[2]), height=int(sys.argv[3]), scale=Commands.number(sys.argv[4]))
+            print("OK", flush=True)
+            return 0
+        commands = Commands(int(sys.argv[1]), int(sys.argv[2]))
+        print("READY", flush=True)
+        while True:
+            raw = sys.stdin.buffer.readline(65537)
+            if not raw:
+                return 0
+            if len(raw) > 65536 or not raw.endswith(b"\n"):
+                return 1
+            try:
+                for event in commands.decode(raw[:-1].decode("utf-8")):
+                    controller.call("input", event=event)
+                print("OK", flush=True)
+            except (ValueError, UnicodeError):
+                print("ERR input rejected", flush=True)
+    except (OSError, ValueError, KeyError):
+        print("ERR desktop input unavailable", flush=True)
+        return 1
+    finally:
+        if controller is not None:
+            controller.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

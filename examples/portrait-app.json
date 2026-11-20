@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "id": "portrait-files",
+  "source": {
+    "kind": "launched_app",
+    "command": [
+      "./scripts/launch-iced-app",
+      "files-app"
+    ]
+  },
+  "viewport": {
+    "width": 390,
+    "height": 844,
+    "scale": 1.0,
+    "refresh_hz": 60
+  },
+  "permissions": {
+    "input": true,
+    "clipboard": false,
+    "audio_playback": false,
+    "microphone": false
+  },
+  "media": {
+    "video_codecs": [
+      "h264"
+    ],
+    "audio_codec": "opus",
+    "max_bitrate_kbps": 12000
+  }
+}

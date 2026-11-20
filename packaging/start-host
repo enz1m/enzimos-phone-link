@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Runtime paths for the installed optional host; no compilation or installation.
+set -euo pipefail
+helpers=/usr/libexec/enzimos-phone-link
+if /usr/bin/timeout 5 /usr/bin/systemctl --user --quiet is-active enzremote-host.service; then
+    printf '%s\n' 'The previous phone host is running. Save its remote work and stop it before enabling Phone Link.' >&2
+    exit 78
+else
+    legacy_status=$?
+    if [[ $legacy_status != 3 && $legacy_status != 4 ]]; then
+        printf '%s\n' 'The previous phone host could not be checked. Try enabling Phone Link again when the user service manager is available.' >&2
+        exit 78
+    fi
+fi
+export ENZREMOTE_COMPOSITOR_HELPER="${ENZREMOTE_COMPOSITOR_HELPER:-/usr/share/enzui/enzui-hypr}"
+export ENZREMOTE_COMPOSITOR_BUILD_DIR="${ENZREMOTE_COMPOSITOR_BUILD_DIR:-/usr/lib/enzui/compositor}"
+export ENZREMOTE_ICED_APPS_DIR="${ENZREMOTE_ICED_APPS_DIR:-/usr/lib/enzui/apps}"
+export ENZREMOTE_WEBRTC_HELPER="$helpers/enzremote-webrtc-server"
+export ENZREMOTE_INPUT_WL_HELPER="$helpers/enzremote-input-wl"
+export ENZREMOTE_SCREENCOPY_HELPER="$helpers/enzremote-screencopy"
+export ENZREMOTE_UPLINK_HELPER="$helpers/enzremote-uplink"
+export ENZREMOTE_PORTAL_HELPER="$helpers/portal-session-helper"
+export ENZREMOTE_DESKTOP_INPUT_HELPER="$helpers/desktop-input"
+export ENZREMOTE_WINDOW_SNAPSHOT_HELPER=/usr/lib/enzui/bin/window-snapshot
+export ENZREMOTE_PLACEHOLDER_HELPER=/usr/lib/enzui/bin/enzui-remote-placeholder
+export ENZREMOTE_CLIPBOARD_BACKEND=shell
+export ENZREMOTE_REQUIRE_ACTIVE_SESSION=1
+export ENZREMOTE_REQUIRE_PAIRING=1
+export ENZREMOTE_ALLOW_ANONYMOUS_LOOPBACK=0
+export ENZREMOTE_ALLOW_LAN_PLAINTEXT=0
+export ENZREMOTE_ALLOW_LEGACY_COMMANDS=0
+export ENZREMOTE_TLS=on
+if [[ -n ${ENZUI_HYPR_RUNROOT:-} ]]; then export ENZREMOTE_DESKTOP_RUNROOT="$ENZUI_HYPR_RUNROOT"; fi
+if [[ -n ${ENZUI_DESKTOP_ROOT:-} ]]; then export ENZREMOTE_DESKTOP_ROOT="$ENZUI_DESKTOP_ROOT"; fi
+exec "$helpers/enzremote-signaling" serve

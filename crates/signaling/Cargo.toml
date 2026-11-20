@@ -1,0 +1,46 @@
+[package]
+name = "enzremote-signaling"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = ["tls"]
+tls = ["tokio-rustls", "rcgen"]
+
+[dependencies]
+enzimos-phone-client = { path = "../host-client" }
+enzui-security.workspace = true
+enzremote-session = { path = "../sessiond" }
+enzremote-webrtc-ipc = { path = "../webrtc-ipc" }
+hostname = "0.4"
+nix = { version = "0.31", features = ["fs", "user"] }
+mdns-sd = "0.20"
+serde.workspace = true
+serde_json.workspace = true
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time", "fs", "process", "io-util"] }
+tokio-tungstenite = "0.26"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tokio-rustls = { version = "0.26", optional = true }
+rcgen = { version = "0.14", optional = true }
+sha2 = "0.10"
+qrcode = { version = "0.14", default-features = false }
+if-addrs = "0.15"
+# App icons: SVG/PNG rendering without system libraries.
+resvg = { version = "0.45", default-features = false }
+tiny-skia = "0.11"
+jpeg-encoder = "0.6"
+# File transfer chunks.
+base64 = "0.22"
+# Desktop clipboard through Xwayland (GNOME has no data-control protocol).
+x11rb = { version = "0.13", default-features = false, features = ["xfixes"] }
+# Desktop notifications, media players (MPRIS) and GNOME remote desktop.
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+
+[dev-dependencies]
+tempfile = "3.27"
+
+[lints]
+workspace = true

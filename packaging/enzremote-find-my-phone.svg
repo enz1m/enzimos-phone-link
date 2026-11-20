@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <title>Find My Phone</title>
+  <defs>
+    <filter id="enz-findmyphone-drop" x="-20%" y="-20%" width="140%" height="140%" color-interpolation-filters="sRGB">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="2"/>
+      <feOffset dy="2" result="blur"/>
+      <feComponentTransfer in="blur" result="shadow">
+        <feFuncA type="linear" slope="0.28"/>
+      </feComponentTransfer>
+      <feMerge>
+        <feMergeNode in="shadow"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- portrait keyline; charcoal phone 62 x 98 (33..95 x 15..113), radius 12, no back sheet; screen inset 6, radius 4;
+       locating rings on the screen: ring r 18 (stroke 7, light mint), dot r 8 in Phone Link mint -->
+  <g filter="url(#enz-findmyphone-drop)">
+    <rect x="33" y="15" width="62" height="98" rx="12" fill="#2F3238"/>
+  </g>
+  <rect x="39" y="21" width="50" height="86" rx="4" fill="#FFFFFF"/>
+  <circle cx="64" cy="64" r="18" fill="none" stroke="#7EE2BE" stroke-width="7"/>
+  <circle cx="64" cy="64" r="8" fill="#12B886"/>
+</svg>

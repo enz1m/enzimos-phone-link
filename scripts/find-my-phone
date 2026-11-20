@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Ring the connected phone at full volume (Find My Phone desktop entry).
+set -euo pipefail
+root="$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+env_file="${XDG_CONFIG_HOME:-$HOME/.config}/enzremote/host.env"
+profile=debug
+if [[ -f "$env_file" ]]; then
+    value="$(sed -n 's/^ENZREMOTE_BUILD_PROFILE=//p' "$env_file" | tail -1 | tr -d '"')"
+    profile="${value:-debug}"
+fi
+exec "$root/target/$profile/enzremote-signaling" ring --notify "$@"

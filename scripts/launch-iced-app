@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+apps="${ENZREMOTE_ICED_APPS_DIR:-/usr/lib/enzui/apps}"
+id="${1:-}"
+case "$id" in
+    files-app|text-app|terminal-emulator|task-manager-app|calendar-app|mail-app|music-app|reader-app|store-app|remote-app) ;;
+    *) echo 'Unknown ICED app ID' >&2; exit 2 ;;
+esac
+shift
+binary=$apps/$id
+if [[ -f $binary && -x $binary ]]; then exec "$binary" "$@"; fi
+printf 'ICED app %s is not installed under %s\n' "$id" "$apps" >&2
+exit 1

@@ -1,0 +1,24 @@
+[package]
+name = "enzremote-webrtc-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+enzremote-control = { path = "../control" }
+enzremote-webrtc-ipc = { path = "../webrtc-ipc" }
+gst.workspace = true
+gst-webrtc.workspace = true
+gst-sdp.workspace = true
+gst-rtp = { package = "gstreamer-rtp", version = "0.24.5", features = ["v1_28"] }
+serde.workspace = true
+serde_json.workspace = true
+nix = { version = "0.31", features = ["socket", "uio", "signal", "fs", "net"] }
+evdev = "0.13"
+rustix = { version = "1.1.4", features = ["net"] }
+tempfile = "3.27"
+
+[lints]
+workspace = true

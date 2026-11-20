@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Build the wlr-screencopy capture tool (enzremote-screencopy).
+#
+# Uses zwlr_screencopy_manager_v1 to capture frames from a Wayland
+# compositor with persistent connection and SHM buffer reuse.
+# Much lower latency than spawning grim per frame.
+
+project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+compositor_root=${ENZUI_COMPOSITOR_SETUP_DIR:?Set ENZUI_COMPOSITOR_SETUP_DIR to the initialized Shell source checkout}
+protocol=$compositor_root/vendor/Hyprland/protocols/wlr-screencopy-unstable-v1.xml
+build_dir=$project_root/target/screencopy
+header=$build_dir/wlr-screencopy-unstable-v1-client-protocol.h
+code=$build_dir/wlr-screencopy-unstable-v1-protocol.c
+binary=$build_dir/enzremote-screencopy
+read -r -a wayland_flags <<<"$(pkg-config --cflags --libs wayland-client)"
+
+[[ -f "$protocol" ]] || {
+    printf 'screencopy protocol not found: %s\n' "$protocol" >&2
+    exit 1
+}
+
+mkdir -p -- "$build_dir"
+wayland-scanner client-header "$protocol" "$header"
+wayland-scanner private-code "$protocol" "$code"
+cc -D_DEFAULT_SOURCE -D_POSIX_C_SOURCE=200809L -std=c11 -Wall -Wextra -Werror -O2 \
+    -I"$build_dir" \
+    "$project_root/tools/enzremote-screencopy.c" "$code" \
+    -o "$binary" "${wayland_flags[@]}" -lrt
+printf '%s\n' "$binary"

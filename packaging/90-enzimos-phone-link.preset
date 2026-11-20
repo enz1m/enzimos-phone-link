@@ -1,0 +1,2 @@
+# Phone pairing and sharing start only after the user enables Phone Link.
+disable enzimos-phone-link.service

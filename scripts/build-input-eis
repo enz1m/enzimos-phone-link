@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+build_dir=$project_root/target/input-eis
+binary=$build_dir/enzremote-input-eis
+read -r -a libei_flags <<<"$(pkg-config --cflags --libs libei-1.0)"
+
+mkdir -p -- "$build_dir"
+cc -D_POSIX_C_SOURCE=200809L -std=c11 -Wall -Wextra -Werror \
+    "$project_root/tools/enzremote-input-eis.c" \
+    -o "$binary" "${libei_flags[@]}"
+
+printf '%s\n' "$binary"

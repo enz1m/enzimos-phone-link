@@ -1,0 +1,23 @@
+[Unit]
+Description=enzimOS Phone Link
+Documentation=file:/usr/share/doc/enzimos-phone-link/README.md
+PartOf=enzui-session.target
+After=graphical-session-pre.target
+ConditionEnvironment=WAYLAND_DISPLAY
+
+[Service]
+Type=simple
+Environment=XDG_CONFIG_HOME=%E
+EnvironmentFile=-%E/enzimos-phone-link/host.env
+ExecStart=/usr/libexec/enzimos-phone-link/start-host
+Restart=on-failure
+RestartSec=3
+RestartPreventExitStatus=78
+TimeoutStopSec=10
+KillMode=control-group
+UMask=0077
+LimitCORE=0
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=enzui-session.target

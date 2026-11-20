@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${ENZREMOTE_CAPTURE_OUTPUT:?ENZREMOTE_CAPTURE_OUTPUT is required}"
+[[ "$ENZREMOTE_CAPTURE_OUTPUT" =~ ^[A-Za-z0-9._-]{1,80}$ ]] || {
+    printf 'invalid output name\n' >&2
+    exit 1
+}
+
+printf '[SELECTION]/screen:%s\n' "$ENZREMOTE_CAPTURE_OUTPUT"

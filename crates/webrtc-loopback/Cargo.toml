@@ -1,0 +1,17 @@
+[package]
+name = "enzremote-webrtc-loopback"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+enzremote-control = { path = "../control" }
+gst.workspace = true
+gst-webrtc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

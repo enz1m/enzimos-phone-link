@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ $# -eq 2 ]] || {
+    printf 'usage: portal-capture-probe OUTPUT CONSUMER\n' >&2
+    exit 2
+}
+
+output=$1
+consumer=$2
+project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+runtime_root=${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR is required}/enzremote-capture
+xdph_prefix=${ENZREMOTE_XDPH_PREFIX:-$XDG_RUNTIME_DIR/enzremote-xdph}
+portal=/usr/lib/xdg-desktop-portal
+backend=$xdph_prefix/libexec/xdg-desktop-portal-hyprland
+
+: "${WAYLAND_DISPLAY:?WAYLAND_DISPLAY is required}"
+: "${HYPRLAND_INSTANCE_SIGNATURE:?HYPRLAND_INSTANCE_SIGNATURE is required}"
+
+[[ "$output" =~ ^[A-Za-z0-9._-]{1,80}$ ]] || {
+    printf 'invalid output name\n' >&2
+    exit 2
+}
+[[ -x "$consumer" ]] || {
+    printf 'consumer is not executable: %s\n' "$consumer" >&2
+    exit 2
+}
+[[ -x "$portal" && -x "$backend" ]] || {
+    printf 'portal test binaries are unavailable\n' >&2
+    exit 1
+}
+
+mkdir -p -- "$runtime_root"
+
+export ENZREMOTE_CAPTURE_OUTPUT=$output
+export PATH=$project_root/scripts:$PATH
+export XDG_CONFIG_HOME=$project_root/examples/xdph
+export XDG_CURRENT_DESKTOP=Hyprland
+export XDG_DATA_DIRS=$xdph_prefix/share:/usr/local/share:/usr/share
+
+# The single-quoted program intentionally expands variables in the inner shell.
+# shellcheck disable=SC2016
+dbus-run-session -- bash -c '
+    set -euo pipefail
+    backend_pid=
+    portal_pid=
+    backend_args=()
+    [[ "${ENZREMOTE_XDPH_VERBOSE:-0}" == 1 ]] && backend_args=(-v)
+    cleanup() {
+        [[ -z "$portal_pid" ]] || kill "$portal_pid" 2>/dev/null || true
+        [[ -z "$backend_pid" ]] || kill "$backend_pid" 2>/dev/null || true
+        [[ -z "$portal_pid" ]] || wait "$portal_pid" 2>/dev/null || true
+        [[ -z "$backend_pid" ]] || wait "$backend_pid" 2>/dev/null || true
+    }
+    trap cleanup EXIT INT TERM
+
+    stdbuf -oL -eL "$1" "${backend_args[@]}" >"$2/isolated-xdph.log" 2>&1 &
+    backend_pid=$!
+    stdbuf -oL -eL "$3" -vr >"$2/isolated-portal.log" 2>&1 &
+    portal_pid=$!
+
+    sleep 1
+    kill -0 "$backend_pid"
+    kill -0 "$portal_pid"
+    "$4/scripts/portal-webrtc-probe" "$5" "$6"
+' bash "$backend" "$runtime_root" "$portal" "$project_root" "$output" "$consumer"

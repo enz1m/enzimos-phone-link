@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "id": "tablet-terminal",
+  "source": {
+    "kind": "launched_app",
+    "command": [
+      "./scripts/launch-iced-app",
+      "terminal-emulator"
+    ]
+  },
+  "viewport": {
+    "width": 1640,
+    "height": 2360,
+    "scale": 2.0,
+    "refresh_hz": 60
+  },
+  "permissions": {
+    "input": true,
+    "clipboard": false,
+    "audio_playback": false,
+    "microphone": false
+  },
+  "media": {
+    "video_codecs": [
+      "h264"
+    ],
+    "audio_codec": "opus",
+    "max_bitrate_kbps": 20000
+  }
+}

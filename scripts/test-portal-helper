@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+import importlib.machinery
+import importlib.util
+from pathlib import Path
+import subprocess
+import socket
+import sys
+import threading
+import tempfile
+import unittest
+import xml.etree.ElementTree as ET
+
+loader = importlib.machinery.SourceFileLoader("portal_helper", str(Path(__file__).with_name("portal-session-helper")))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+helper = importlib.util.module_from_spec(spec)
+loader.exec_module(helper)
+
+
+class PortalHelperTests(unittest.TestCase):
+    def test_app_capture_hides_cursor_by_default(self):
+        self.assertEqual(helper.cursor_mode({}), 1)
+        self.assertEqual(helper.cursor_mode({"ENZREMOTE_CAPTURE_CURSOR": "embedded"}), 2)
+        with self.assertRaises(RuntimeError):
+            helper.cursor_mode({"ENZREMOTE_CAPTURE_CURSOR": "invalid"})
+
+    def test_backend_must_be_executable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / "backend"
+            binary.write_text("not launched")
+            self.assertIsNone(helper.backend_path(root, {"ENZREMOTE_XDPH_BACKEND": str(binary)}))
+            binary.chmod(0o700)
+            self.assertEqual(helper.backend_path(root, {"ENZREMOTE_XDPH_BACKEND": str(binary)}), str(binary))
+
+    def test_response_subscribed_before_call(self):
+        class Bus:
+            callback = None
+            removed = False
+            def get_unique_name(self): return ":1.23"
+            def add_signal_receiver(self, callback, **kwargs):
+                self.callback = callback
+                self.path = kwargs["path"]
+                return self
+            def remove(self): self.removed = True
+        bus = Bus()
+        def method(options, **kwargs):
+            self.assertIsNotNone(bus.callback)
+            self.assertEqual(str(options["handle_token"]), "unit")
+            bus.callback(0, {"session_handle": "/session"})
+            return bus.path
+        self.assertEqual(helper.request(bus, method, "unit")["session_handle"], "/session")
+        self.assertTrue(bus.removed)
+
+    def test_rejected_request_does_not_leak_subscription(self):
+        class Bus:
+            def get_unique_name(self): return ":1.23"
+            def add_signal_receiver(self, callback, **kwargs):
+                self.callback = callback
+                self.path = kwargs["path"]
+                return self
+            def remove(self): self.removed = True
+        bus = Bus()
+        def method(options, **kwargs):
+            bus.callback(1, {})
+            return bus.path
+        with self.assertRaises(RuntimeError): helper.request(bus, method, "unit")
+        self.assertTrue(bus.removed)
+
+    def test_private_paths_preserve_only_explicit_capture_endpoints(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            env = {"XDG_RUNTIME_DIR": "/host/runtime", "WAYLAND_DISPLAY": "wayland-7", "XDG_DATA_HOME": "/host/data"}
+            helper.private_environment(env, root)
+            self.assertEqual(env["WAYLAND_DISPLAY"], "/host/runtime/wayland-7")
+            self.assertEqual(env["PIPEWIRE_RUNTIME_DIR"], "/host/runtime")
+            self.assertEqual(env["XDG_RUNTIME_DIR"], str(root))
+            self.assertEqual(env["XDG_DATA_HOME"], str(root / "data"))
+            self.assertTrue((root / "state").is_dir())
+
+    def test_private_bus_has_no_service_activation_directories(self):
+        config = ET.fromstring(helper.bus_config(Path("/private/a & b")))
+        self.assertEqual(config.findtext("type"), "session")
+        self.assertNotIn(" ", config.findtext("listen"))
+        self.assertIsNone(config.find("standard_session_servicedirs"))
+        self.assertIsNone(config.find("servicedir"))
+        self.assertIsNone(config.find("include"))
+
+    def test_peer_disconnect_ends_session_watch(self):
+        control, peer = socket.socketpair()
+        with control, peer:
+            peer.close()
+            helper.keep_alive(control, [])
+
+    def test_child_failure_ends_session_watch(self):
+        class ExitedChild:
+            def poll(self): return 1
+        control, peer = socket.socketpair()
+        with control, peer:
+            deadline = threading.Timer(2, peer.close)
+            deadline.start()
+            try:
+                with self.assertRaisesRegex(RuntimeError, "portal process exited"):
+                    helper.keep_alive(control, [ExitedChild()])
+            finally:
+                deadline.cancel()
+                deadline.join()
+
+    def test_shutdown_reaps_children(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            helper.stop_children([child])
+            self.assertIsNotNone(child.poll())
+        finally:
+            if child.poll() is None: child.kill(); child.wait()
+
+
+if __name__ == "__main__":
+    unittest.main()

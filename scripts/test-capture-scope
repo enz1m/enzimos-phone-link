@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""Named-output failures must not launch an unscoped CPU capture helper."""
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+
+root = Path(__file__).resolve().parent.parent
+target = Path(os.environ.get('CARGO_TARGET_DIR', root / 'target'))
+binary = target.resolve() / 'debug/enzremote-webrtc-server'
+assert binary.is_file(), 'Build enzremote-webrtc-server first'
+(root / 'target').mkdir(exist_ok=True)
+with tempfile.TemporaryDirectory(prefix='scope-', dir=root / 'target') as directory:
+    directory = Path(directory)
+    marker = directory / 'capture-started'
+    capture = directory / 'capture-helper'
+    portal = directory / 'portal-helper'
+    capture.write_text('#!/bin/sh\ntouch "$ENZREMOTE_SCOPE_TEST_MARKER"\nexit 1\n')
+    portal.write_text('#!/bin/sh\nexit 1\n')
+    capture.chmod(0o700)
+    portal.chmod(0o700)
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith('ENZREMOTE_') and key not in ('WAYLAND_DISPLAY', 'DISPLAY')}
+    env.update(ENZREMOTE_CAPTURE_OUTPUT='ENZREMOTE-APP',
+               ENZREMOTE_GRIM_DISPLAY='wayland-no-capture-scope-test',
+               ENZREMOTE_ENCODER='openh264',
+               ENZREMOTE_PORTAL_HELPER=str(portal),
+               ENZREMOTE_SCREENCOPY_HELPER=str(capture),
+               ENZREMOTE_SCOPE_TEST_MARKER=str(marker))
+    helper = root / 'target/screencopy/enzremote-screencopy'
+    assert helper.is_file(), 'Build the screencopy helper first'
+    direct = subprocess.run([str(helper)], env=env, capture_output=True, text=True, timeout=3)
+    assert direct.returncode != 0 and 'named-output capture is not supported' in direct.stderr
+    for mode in ('screencopy', 'auto'):
+        result = subprocess.run([str(binary), str(directory / (mode + '.sock'))],
+                                env={**env, 'ENZREMOTE_CAPTURE_MODE': mode},
+                                capture_output=True, text=True, timeout=8)
+        assert result.returncode != 0, mode
+        assert not result.stdout.startswith('READY'), mode
+        assert not marker.exists(), 'Unscoped capture helper was launched'
+        if mode == 'screencopy':
+            assert 'unscoped CPU fallback is disabled' in result.stderr, result.stderr
+    override = subprocess.run([str(binary), str(directory / 'override.sock')],
+                              env={**env, 'ENZREMOTE_PIPEWIRE_TARGET': ''},
+                              capture_output=True, text=True, timeout=3)
+    assert override.returncode != 0 and 'target override' in override.stderr
+    no_display = {key: value for key, value in env.items() if key != 'ENZREMOTE_GRIM_DISPLAY'}
+    no_display['ENZREMOTE_CAPTURE_MODE'] = 'screencopy'
+    refused_test_source = subprocess.run([str(binary), str(directory / 'no-display.sock')],
+                                        env=no_display, capture_output=True, text=True, timeout=3)
+    assert refused_test_source.returncode != 0 and not refused_test_source.stdout.startswith('READY')
+    assert not marker.exists()
+print('Capture scope: named requests reject unscoped CPU, target override and portal-failure fallback')

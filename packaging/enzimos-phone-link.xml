@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<service>
+  <short>enzimOS Phone Link</short>
+  <description>Paired phone connections, file and clipboard sharing, notifications and encrypted application media. Enable only on trusted networks.</description>
+  <port protocol="tcp" port="9470"/>
+  <port protocol="udp" port="9471-9599"/>
+  <include service="mdns"/>
+</service>

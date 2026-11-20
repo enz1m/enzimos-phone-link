@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Phone Link
+Comment=Paired phones, sharing and application streaming
+Exec=/usr/libexec/enzimos-phone-link/enzremote-signaling settings
+Icon=org.enzimos.PhoneLink
+NoDisplay=true
+Terminal=false
+StartupNotify=false
+Categories=Network;RemoteAccess;

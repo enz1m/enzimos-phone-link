@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ "${1:-}" == "--pipewire-fd" && "${3:-}" == "--pipewire-node" && $# -eq 4 ]] || {
+    printf 'usage: portal-pipewire-smoke --pipewire-fd FD --pipewire-node NODE_ID\n' >&2
+    exit 2
+}
+[[ "$2" =~ ^[0-9]+$ && "$4" =~ ^[0-9]+$ ]] || {
+    printf 'FD and node ID must be decimal integers\n' >&2
+    exit 2
+}
+
+source=(pipewiresrc fd="$2" path="$4" do-timestamp=true num-buffers=1)
+if [[ -n "${ENZREMOTE_PIPEWIRE_SERIAL:-}" ]]; then
+    [[ "$ENZREMOTE_PIPEWIRE_SERIAL" =~ ^[0-9]+$ ]] || {
+        printf 'ENZREMOTE_PIPEWIRE_SERIAL must be a decimal integer\n' >&2
+        exit 2
+    }
+    source+=(target-object="$ENZREMOTE_PIPEWIRE_SERIAL")
+fi
+
+gst-launch-1.0 -q "${source[@]}" ! videoconvert ! video/x-raw ! \
+    fakesink sync=false
+
+printf 'Portal PipeWire smoke test passed.\n'

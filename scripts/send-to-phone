@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Send files to the connected phone (used by the "Send to Phone" desktop entry
+# and the Nautilus script). Reports the outcome as a desktop notification.
+set -euo pipefail
+root="$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+env_file="${XDG_CONFIG_HOME:-$HOME/.config}/enzremote/host.env"
+profile=debug
+if [[ -f "$env_file" ]]; then
+    value="$(sed -n 's/^ENZREMOTE_BUILD_PROFILE=//p' "$env_file" | tail -1 | tr -d '"')"
+    profile="${value:-debug}"
+fi
+exec "$root/target/$profile/enzremote-signaling" send --notify "$@"

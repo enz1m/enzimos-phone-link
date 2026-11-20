@@ -1,0 +1,28 @@
+[package]
+name = "enzremote-uplink"
+description = "Receives a phone's screen or camera (WebRTC) into a window or a PipeWire camera"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+enzremote-webrtc-ipc = { path = "../webrtc-ipc" }
+gst.workspace = true
+gst-webrtc.workspace = true
+gst-sdp.workspace = true
+gst-app.workspace = true
+gst-video.workspace = true
+iced.workspace = true
+enzui-core.workspace = true
+enzui-theme.workspace = true
+enzui-widgets.workspace = true
+serde_json.workspace = true
+nix = { version = "0.31", features = ["net"] }
+
+[dev-dependencies]
+tempfile = "3.27"
+
+[lints]
+workspace = true

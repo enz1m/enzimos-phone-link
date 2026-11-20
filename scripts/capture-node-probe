@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""Create a bounded XDPH output stream for local integration tests only."""
+
+import argparse
+import json
+import os
+import time
+
+import dbus
+
+
+DESTINATION = "org.freedesktop.impl.portal.desktop.hyprland"
+PORTAL_PATH = "/org/freedesktop/portal/desktop"
+SCREENCAST_INTERFACE = "org.freedesktop.impl.portal.ScreenCast"
+SESSION_INTERFACE = "org.freedesktop.impl.portal.Session"
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("output", help="Exact nested compositor output name")
+    parser.add_argument("--hold-seconds", type=float, default=15.0)
+    args = parser.parse_args()
+    if args.hold_seconds <= 0 or args.hold_seconds > 300:
+        parser.error("--hold-seconds must be greater than 0 and at most 300")
+
+    token = f"p{os.getpid()}"
+    request_path = f"/org/freedesktop/portal/desktop/request/enzremote/{token}"
+    session_path = f"/org/freedesktop/portal/desktop/session/enzremote/{token}"
+
+    bus = dbus.SessionBus()
+    portal = dbus.Interface(bus.get_object(DESTINATION, PORTAL_PATH), SCREENCAST_INTERFACE)
+    empty = dbus.Dictionary({}, signature="sv")
+
+    response, _ = portal.CreateSession(
+        dbus.ObjectPath(request_path),
+        dbus.ObjectPath(session_path),
+        "dev.enzui.RemoteCaptureProbe",
+        empty,
+    )
+    if response != 0:
+        raise RuntimeError(f"CreateSession failed with response {response}")
+
+    restore_values = dbus.Dictionary(
+        {
+            "output": dbus.String(args.output, variant_level=1),
+            "withCursor": dbus.UInt32(0, variant_level=1),
+            "timeIssued": dbus.UInt64(int(time.time()), variant_level=1),
+            "token": dbus.String("test-only", variant_level=1),
+        },
+        signature="sv",
+        variant_level=1,
+    )
+    restore_data = dbus.Struct(
+        (
+            dbus.String("hyprland"),
+            dbus.UInt32(3),
+            restore_values,
+        ),
+        signature="suv",
+        variant_level=1,
+    )
+    select_options = dbus.Dictionary(
+        {
+            "cursor_mode": dbus.UInt32(1, variant_level=1),
+            "persist_mode": dbus.UInt32(0, variant_level=1),
+            "restore_data": restore_data,
+        },
+        signature="sv",
+    )
+    response, _ = portal.SelectSources(
+        dbus.ObjectPath(request_path),
+        dbus.ObjectPath(session_path),
+        "dev.enzui.RemoteCaptureProbe",
+        select_options,
+    )
+    if response != 0:
+        raise RuntimeError(f"SelectSources failed with response {response}")
+
+    response, results = portal.Start(
+        dbus.ObjectPath(request_path),
+        dbus.ObjectPath(session_path),
+        "dev.enzui.RemoteCaptureProbe",
+        "",
+        empty,
+    )
+    if response != 0:
+        raise RuntimeError(f"Start failed with response {response}")
+
+    streams = results.get("streams", [])
+    if len(streams) != 1:
+        raise RuntimeError(f"expected one stream, received {len(streams)}")
+    node_id, properties = streams[0]
+    width, height = properties["size"]
+    result = {
+        "node_id": int(node_id),
+        "pipewire_serial": int(properties.get("pipewire-serial", 0)),
+        "width": int(width),
+        "height": int(height),
+        "mapping_id": str(properties.get("mapping_id", "")),
+        "hold_seconds": args.hold_seconds,
+    }
+    print(json.dumps(result), flush=True)
+
+    try:
+        time.sleep(args.hold_seconds)
+    finally:
+        session = dbus.Interface(bus.get_object(DESTINATION, session_path), SESSION_INTERFACE)
+        session.Close()
+
+
+if __name__ == "__main__":
+    main()

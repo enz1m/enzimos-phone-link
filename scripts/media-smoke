@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+VA_PLUGIN="$ROOT/third_party/gst-va"
+if [[ -d "$VA_PLUGIN" ]]; then
+    export GST_PLUGIN_PATH="${GST_PLUGIN_PATH:+$GST_PLUGIN_PATH:}$VA_PLUGIN"
+fi
+
+for element in webrtcbin pipewiresrc opusenc rtpopuspay openh264enc h264parse rtph264pay; do
+    gst-inspect-1.0 --exists "$element" || {
+        printf 'missing GStreamer element: %s\n' "$element" >&2
+        exit 1
+    }
+done
+
+gst-launch-1.0 -q \
+    videotestsrc num-buffers=30 pattern=ball ! \
+    video/x-raw,width=390,height=844,framerate=30/1 ! \
+    videoconvert ! \
+    openh264enc usage-type=screen complexity=low bitrate=4000000 ! \
+    h264parse ! \
+    rtph264pay pt=96 ! \
+    fakesink sync=false
+
+printf 'GStreamer OpenH264 portrait H.264/RTP smoke test passed.\n'
+
+if gst-inspect-1.0 --exists vah264enc; then
+    gst-launch-1.0 -q \
+        videotestsrc num-buffers=30 pattern=ball ! \
+        video/x-raw,width=390,height=844,framerate=30/1 ! \
+        vapostproc ! video/x-raw\(memory:VAMemory\),format=NV12 ! \
+        vah264enc rate-control=vcm bitrate=4000 key-int-max=30 target-usage=7 ! \
+        video/x-h264,profile=constrained-baseline ! \
+        h264parse ! rtph264pay pt=96 ! fakesink sync=false
+    printf 'GStreamer VA H.264/RTP smoke test passed.\n'
+fi

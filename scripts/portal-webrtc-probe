@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""Stream one portal output through the local WebRTC integration binary."""
+
+import argparse
+import os
+import subprocess
+import time
+
+import dbus
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+
+
+DESTINATION = "org.freedesktop.portal.Desktop"
+PORTAL_PATH = "/org/freedesktop/portal/desktop"
+SCREENCAST_INTERFACE = "org.freedesktop.portal.ScreenCast"
+REQUEST_INTERFACE = "org.freedesktop.portal.Request"
+SESSION_INTERFACE = "org.freedesktop.portal.Session"
+
+
+def request(bus: dbus.SessionBus, path: dbus.ObjectPath, timeout_seconds: int = 15):
+    loop = GLib.MainLoop()
+    response = {}
+
+    def complete(code, results):
+        response["code"] = int(code)
+        response["results"] = results
+        loop.quit()
+
+    request_object = bus.get_object(DESTINATION, path)
+    signal = request_object.connect_to_signal(
+        "Response", complete, dbus_interface=REQUEST_INTERFACE
+    )
+    timeout = GLib.timeout_add_seconds(timeout_seconds, loop.quit)
+    loop.run()
+    GLib.source_remove(timeout)
+    signal.remove()
+    if "code" not in response:
+        raise TimeoutError(f"portal request timed out: {path}")
+    if response["code"] != 0:
+        raise RuntimeError(f"portal request {path} failed: {response['code']}")
+    return response["results"]
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("output", help="Exact compositor output name")
+    parser.add_argument("loopback_binary")
+    args = parser.parse_args()
+    if not os.path.isfile(args.loopback_binary):
+        parser.error(f"loopback binary not found: {args.loopback_binary}")
+
+    DBusGMainLoop(set_as_default=True)
+    bus = dbus.SessionBus()
+    portal = dbus.Interface(bus.get_object(DESTINATION, PORTAL_PATH), SCREENCAST_INTERFACE)
+    token = f"enzremote{os.getpid()}"
+
+    create_path = portal.CreateSession(
+        dbus.Dictionary(
+            {
+                "handle_token": dbus.String(f"create{token}", variant_level=1),
+                "session_handle_token": dbus.String(token, variant_level=1),
+            },
+            signature="sv",
+        )
+    )
+    create_results = request(bus, create_path)
+    session_path = create_results["session_handle"]
+
+    restore_values = dbus.Dictionary(
+        {
+            "output": dbus.String(args.output, variant_level=1),
+            "withCursor": dbus.UInt32(1, variant_level=1),
+            "timeIssued": dbus.UInt64(int(time.time()), variant_level=1),
+            "token": dbus.String("test-only", variant_level=1),
+        },
+        signature="sv",
+        variant_level=1,
+    )
+    restore_data = dbus.Struct(
+        (dbus.String("hyprland"), dbus.UInt32(3), restore_values),
+        signature="suv",
+        variant_level=1,
+    )
+    select_path = portal.SelectSources(
+        session_path,
+        dbus.Dictionary(
+            {
+                "handle_token": dbus.String(f"select{token}", variant_level=1),
+                "types": dbus.UInt32(1, variant_level=1),
+                "multiple": dbus.Boolean(False, variant_level=1),
+                "cursor_mode": dbus.UInt32(2, variant_level=1),
+                "persist_mode": dbus.UInt32(0, variant_level=1),
+                "restore_data": restore_data,
+            },
+            signature="sv",
+        ),
+    )
+    request(bus, select_path)
+
+    start_path = portal.Start(
+        session_path,
+        "",
+        dbus.Dictionary(
+            {"handle_token": dbus.String(f"start{token}", variant_level=1)},
+            signature="sv",
+        ),
+    )
+    start_results = request(bus, start_path)
+    streams = start_results.get("streams", [])
+    if len(streams) != 1:
+        raise RuntimeError(f"expected one portal stream, received {len(streams)}")
+    node_id, properties = streams[0]
+    pipewire_serial = int(properties.get("pipewire-serial", 0))
+    print(
+        f"Portal stream: node_id={int(node_id)} serial={pipewire_serial}",
+        flush=True,
+    )
+
+    remote = portal.OpenPipeWireRemote(
+        session_path, dbus.Dictionary({}, signature="sv")
+    )
+    pipewire_fd = remote.take()
+    try:
+        consumer_environment = os.environ.copy()
+        consumer_environment.pop("WAYLAND_DISPLAY", None)
+        consumer_environment.pop("HYPRLAND_INSTANCE_SIGNATURE", None)
+        consumer_environment.pop("DISPLAY", None)
+        consumer_environment.pop("ENZREMOTE_EIS_BROKER_SOCKET", None)
+        consumer_environment.pop("ENZUI_HYPR_CONFIG", None)
+        consumer_environment.pop("ENZUI_HYPR_RUNROOT", None)
+        consumer_environment.pop("ENZUI_HYPR_BUILDROOT", None)
+        if pipewire_serial > 0:
+            consumer_environment["ENZREMOTE_PIPEWIRE_SERIAL"] = str(pipewire_serial)
+        inherited_fds = [pipewire_fd]
+        broker_fd_value = consumer_environment.get("ENZREMOTE_EIS_BROKER_FD")
+        if broker_fd_value is not None:
+            try:
+                broker_fd = int(broker_fd_value)
+                os.fstat(broker_fd)
+            except (OSError, ValueError) as error:
+                raise RuntimeError("invalid inherited EIS broker capability") from error
+            inherited_fds.append(broker_fd)
+        subprocess.run(
+            [
+                args.loopback_binary,
+                "--pipewire-fd",
+                str(pipewire_fd),
+                "--pipewire-node",
+                str(int(node_id)),
+            ],
+            check=True,
+            env=consumer_environment,
+            pass_fds=tuple(inherited_fds),
+        )
+    finally:
+        os.close(pipewire_fd)
+        session = dbus.Interface(bus.get_object(DESTINATION, session_path), SESSION_INTERFACE)
+        session.Close()
+
+
+if __name__ == "__main__":
+    main()

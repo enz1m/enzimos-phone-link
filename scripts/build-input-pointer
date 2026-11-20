@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+compositor_root=${ENZUI_COMPOSITOR_SETUP_DIR:?Set ENZUI_COMPOSITOR_SETUP_DIR to the initialized Shell source checkout}
+protocol=$compositor_root/vendor/Hyprland/protocols/wlr-virtual-pointer-unstable-v1.xml
+build_dir=$project_root/target/input-pointer
+header=$build_dir/wlr-virtual-pointer-unstable-v1-client-protocol.h
+code=$build_dir/wlr-virtual-pointer-unstable-v1-protocol.c
+binary=$build_dir/enzremote-input-pointer
+read -r -a wayland_flags <<<"$(pkg-config --cflags --libs wayland-client)"
+
+[[ -f "$protocol" ]] || {
+    printf 'virtual pointer protocol not found: %s\n' "$protocol" >&2
+    exit 1
+}
+
+mkdir -p -- "$build_dir"
+wayland-scanner client-header "$protocol" "$header"
+wayland-scanner private-code "$protocol" "$code"
+cc -D_POSIX_C_SOURCE=200809L -std=c11 -Wall -Wextra -Werror \
+    -I"$build_dir" \
+    "$project_root/tools/enzremote-input-pointer.c" "$code" \
+    -o "$binary" "${wayland_flags[@]}"
+
+printf '%s\n' "$binary"

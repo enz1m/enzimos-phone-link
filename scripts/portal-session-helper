@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""Own a private portal session; return its restricted PipeWire FD on stdin socket."""
+
+import array
+import json
+import os
+from pathlib import Path
+import re
+import select
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import quote
+
+import dbus
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+
+DEST = "org.freedesktop.portal.Desktop"
+PATH = "/org/freedesktop/portal/desktop"
+SC = "org.freedesktop.portal.ScreenCast"
+REQ = "org.freedesktop.portal.Request"
+
+
+def backend_path(root, env):
+    candidates = [env.get("ENZREMOTE_XDPH_BACKEND", ""),
+                  str(Path(env.get("ENZREMOTE_XDPH_PREFIX", "/nonexistent")) / "libexec/xdg-desktop-portal-hyprland"),
+                  "/usr/lib/xdg-desktop-portal-hyprland"]
+    return next((p for p in candidates if p and os.path.isfile(p) and os.access(p, os.X_OK)), None)
+
+
+def stop_children(children):
+    for child in reversed(children):
+        if child.poll() is None:
+            child.terminate()
+    for child in reversed(children):
+        try:
+            child.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait(timeout=1)
+
+
+def request(bus, method, token, *args):
+    # Register before invoking: a fast portal may emit Response before the call returns.
+    sender = bus.get_unique_name().lstrip(":").replace(".", "_")
+    expected = f"/org/freedesktop/portal/desktop/request/{sender}/{token}"
+    loop = GLib.MainLoop()
+    result = {}
+
+    def response(code, values):
+        result.update(code=int(code), values=values)
+        loop.quit()
+
+    match = bus.add_signal_receiver(response, signal_name="Response", dbus_interface=REQ, path=expected)
+    timer = GLib.timeout_add(6000, lambda: (loop.quit(), False)[1])
+    try:
+        options = dbus.Dictionary({"handle_token": dbus.String(token, variant_level=1)}, signature="sv")
+        if args and isinstance(args[-1], dict):
+            options.update(args[-1])
+            args = args[:-1]
+        returned = str(method(*args, options, timeout=6))
+        if returned != expected:
+            raise RuntimeError("portal returned an unexpected request path")
+        if not result:
+            loop.run()
+        if result.get("code") != 0:
+            raise RuntimeError(f"portal request failed or timed out ({result.get('code')})")
+        return result["values"]
+    finally:
+        match.remove()
+        if GLib.MainContext.default().find_source_by_id(timer):
+            GLib.source_remove(timer)
+
+
+def keep_alive(control, children):
+    loop = GLib.MainLoop()
+    failed = []
+
+    def check_children():
+        if any(child.poll() is not None for child in children):
+            failed.append("private portal process exited")
+            loop.quit()
+            return False
+        return True
+
+    watch = GLib.io_add_watch(control.fileno(), GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR,
+                             lambda *_: (loop.quit(), False)[1])
+    timer = GLib.timeout_add(250, check_children)
+    try:
+        loop.run()
+        if failed:
+            raise RuntimeError(failed[0])
+    finally:
+        for source in (watch, timer):
+            if GLib.MainContext.default().find_source_by_id(source):
+                GLib.source_remove(source)
+
+
+def private_environment(env, directory):
+    original_runtime = env["XDG_RUNTIME_DIR"]
+    wayland = Path(env["WAYLAND_DISPLAY"])
+    if not wayland.is_absolute():
+        env["WAYLAND_DISPLAY"] = str(Path(original_runtime) / wayland)
+    env["PIPEWIRE_RUNTIME_DIR"] = env.get("PIPEWIRE_RUNTIME_DIR") or original_runtime
+    env["XDG_RUNTIME_DIR"] = str(directory)
+    for variable, name in (("XDG_DATA_HOME", "data"), ("XDG_CACHE_HOME", "cache"), ("XDG_STATE_HOME", "state")):
+        path = directory / name
+        path.mkdir(mode=0o700)
+        env[variable] = str(path)
+
+
+def cursor_mode(env):
+    mode = env.get("ENZREMOTE_CAPTURE_CURSOR", "hidden")
+    if mode not in ("hidden", "embedded"):
+        raise RuntimeError("ENZREMOTE_CAPTURE_CURSOR must be hidden or embedded")
+    return 1 if mode == "hidden" else 2
+
+
+def bus_config(directory):
+    address = "unix:path=" + quote(str(directory / "bus"), safe="/")
+    return ("<busconfig><type>session</type><auth>EXTERNAL</auth>"
+            f"<listen>{address}</listen><policy context='default'>"
+            "<allow send_destination='*'/><allow receive_sender='*'/><allow own='*'/>"
+            "</policy></busconfig>")
+
+
+def run(control):
+    root = Path(__file__).resolve().parent
+    env = os.environ.copy()
+    output = env.get("ENZREMOTE_CAPTURE_OUTPUT", "")
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", output):
+        raise RuntimeError("an exact session output name is required")
+    backend = backend_path(root, env)
+    if not backend:
+        raise RuntimeError("prebuilt XDPH backend unavailable")
+    env["WAYLAND_DISPLAY"] = env["ENZREMOTE_WAYLAND_DISPLAY"]
+    env["HYPRLAND_INSTANCE_SIGNATURE"] = env["ENZREMOTE_HYPRLAND_INSTANCE"]
+    env["XDG_CURRENT_DESKTOP"] = "Hyprland"
+    env["PATH"] = str(root) + os.pathsep + env["PATH"]
+    prefix = Path(env.get("ENZREMOTE_COMPOSITOR_BUILD_DIR", "/usr/lib/enzui/compositor"))
+    env["LD_LIBRARY_PATH"] = str(prefix / "prefix/lib") + os.pathsep + env.get("LD_LIBRARY_PATH", "")
+    children = []
+    session = None
+    DBusGMainLoop(set_as_default=True)
+    with tempfile.TemporaryDirectory(prefix="portal-", dir=env.get("ENZREMOTE_PORTAL_RUNTIME_DIR", env["XDG_RUNTIME_DIR"])) as temporary:
+        directory = Path(temporary)
+        private_environment(env, directory)
+        portals = directory / "share/xdg-desktop-portal/portals"
+        portals.mkdir(parents=True)
+        (portals / "hyprland.portal").write_text("[portal]\nDBusName=org.freedesktop.impl.portal.desktop.hyprland\nInterfaces=org.freedesktop.impl.portal.ScreenCast;\nUseIn=Hyprland;\n")
+        env["XDG_DATA_DIRS"] = str(directory / "share") + ":/usr/local/share:/usr/share"
+        config = directory / "config"
+        (config / "xdg-desktop-portal").mkdir(parents=True)
+        (config / "xdg-desktop-portal/portals.conf").write_text("[preferred]\ndefault=hyprland\n")
+        (config / "hypr").mkdir()
+        fps = min(240, max(15, int(env.get("ENZREMOTE_VIDEO_FPS", "60"))))
+        (config / "hypr/xdph.conf").write_text(f"screencopy {{\n    custom_picker_binary = xdph-output-picker\n    max_fps = {fps}\n}}\n")
+        env["XDG_CONFIG_HOME"] = str(config)
+        log = open(directory / "portal.log", "wb")
+        try:
+            configuration = directory / "bus.conf"
+            configuration.write_text(bus_config(directory))
+            daemon = subprocess.Popen(["dbus-daemon", f"--config-file={configuration}", "--nofork", "--print-address=1"], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=log)
+            children.append(daemon)
+            if not select.select([daemon.stdout], [], [], 3)[0]:
+                raise RuntimeError("private D-Bus startup timed out")
+            address = daemon.stdout.readline(4096).decode().strip()
+            if not address.startswith("unix:"):
+                raise RuntimeError("private D-Bus address unavailable")
+            env["DBUS_SESSION_BUS_ADDRESS"] = address
+            bus = dbus.bus.BusConnection(address)
+            children.append(subprocess.Popen(["/usr/lib/xdg-permission-store"], env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log))
+            children.append(subprocess.Popen([backend], env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log))
+            children.append(subprocess.Popen(["/usr/lib/xdg-desktop-portal"], env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log))
+            deadline = time.monotonic() + 4
+            while not (bus.name_has_owner(DEST) and bus.name_has_owner("org.freedesktop.impl.portal.desktop.hyprland")):
+                if any(child.poll() is not None for child in children) or time.monotonic() >= deadline:
+                    raise RuntimeError("private portal backend failed to start")
+                time.sleep(0.02)
+            portal = dbus.Interface(bus.get_object(DEST, PATH), SC)
+            token = f"enz{os.getpid()}"
+            result = request(bus, portal.CreateSession, token + "create", {
+                "session_handle_token": dbus.String(token, variant_level=1)})
+            session_path = result["session_handle"]
+            session = dbus.Interface(bus.get_object(DEST, session_path), "org.freedesktop.portal.Session")
+            request(bus, portal.SelectSources, token + "select", session_path, {
+                "types": dbus.UInt32(1, variant_level=1), "multiple": dbus.Boolean(False, variant_level=1),
+                "cursor_mode": dbus.UInt32(cursor_mode(env), variant_level=1), "persist_mode": dbus.UInt32(0, variant_level=1)})
+            result = request(bus, portal.Start, token + "start", session_path, "")
+            streams = result.get("streams", [])
+            if len(streams) != 1:
+                raise RuntimeError("portal must return exactly one video stream")
+            node, properties = streams[0]
+            fd = portal.OpenPipeWireRemote(session_path, dbus.Dictionary({}, signature="sv")).take()
+            try:
+                payload = json.dumps({"node_id": int(node), "serial": int(properties.get("pipewire-serial", 0)),
+                                      "size": list(properties.get("size", [0, 0]))}).encode()
+                control.sendmsg([payload], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [fd]))])
+            finally:
+                os.close(fd)
+            keep_alive(control, children)
+        except Exception:
+            log.flush()
+            lines = (directory / "portal.log").read_text(errors="replace").splitlines()
+            print("portal helper: " + " | ".join(lines[-5:]), file=sys.stderr)
+            raise
+        finally:
+            if session:
+                try:
+                    session.Close(timeout=1)
+                except dbus.DBusException:
+                    pass
+            stop_children(children)
+            log.close()
+
+
+def main():
+    control = socket.socket(fileno=0)
+    def stop(*_):
+        raise InterruptedError("portal stopping")
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    try:
+        run(control)
+    except (Exception, KeyboardInterrupt) as error:
+        try:
+            control.send(json.dumps({"error": str(error)}).encode()[:2048])
+        except OSError:
+            pass
+        return 1
+    finally:
+        control.close()
+        runtime = os.environ.get("ENZREMOTE_PORTAL_RUNTIME_DIR")
+        if runtime:
+            try:
+                os.rmdir(runtime)
+            except OSError:
+                pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

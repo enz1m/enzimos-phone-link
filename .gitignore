@@ -1,0 +1,16 @@
+# Local upstream source checkouts used for research only.
+third_party/sources/
+
+# Extracted distro packages (binary, not tracked).
+third_party/gst-va/
+third_party/gst-rsrtp/
+
+# Build and runtime state.
+/target/
+/.runtime/
+*.log
+__pycache__/
+*.py[cod]
+
+
+/framework/

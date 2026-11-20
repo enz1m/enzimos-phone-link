@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+build="$root/target/input-wl"
+[[ -f "$build/wlr-virtual-pointer-unstable-v1-client-protocol.h" ]] || "$root/scripts/build-input-wl" >/dev/null
+read -r -a flags <<<"$(pkg-config --cflags --libs wayland-client xkbcommon)"
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -std=c11 -Wall -Wextra -Werror \
+    -I"$build" "$root/tools/test-input-wl.c" \
+    "$build/wlr-virtual-pointer-unstable-v1-protocol.c" \
+    "$build/virtual-keyboard-unstable-v1-protocol.c" \
+    -o "$build/test-input-wl" "${flags[@]}" -lrt
+"$build/test-input-wl"
