@@ -13,10 +13,10 @@ publish = false
 unsafe_code = "forbid"
 
 [workspace.dependencies]
-enzui-security = { git = "https://github.com/enz1m/enzui.git", rev = "f48e48082ce968d57734fd9ef090c9131572e179" }
-enzui-core = { git = "https://github.com/enz1m/enzui.git", rev = "f48e48082ce968d57734fd9ef090c9131572e179" }
-enzui-widgets = { git = "https://github.com/enz1m/enzui.git", rev = "f48e48082ce968d57734fd9ef090c9131572e179" }
-enzui-theme = { git = "https://github.com/enz1m/enzui.git", rev = "f48e48082ce968d57734fd9ef090c9131572e179" }
+enzui-security = { git = "https://github.com/enz1m/enzui.git", tag = "v0.3.0-alpha.1" }
+enzui-core = { git = "https://github.com/enz1m/enzui.git", tag = "v0.3.0-alpha.1" }
+enzui-widgets = { git = "https://github.com/enz1m/enzui.git", tag = "v0.3.0-alpha.1" }
+enzui-theme = { git = "https://github.com/enz1m/enzui.git", tag = "v0.3.0-alpha.1" }
 iced = { git = "https://github.com/enz1m/enzim-iced.git", rev = "e36b07b591661fdb666088fc943cc0b927a2367b", default-features = true, features = ["tokio", "a11y", "image-without-codecs"] }
 gst-app = { package = "gstreamer-app", version = "0.24.5", features = ["v1_28"] }
 gst-video = { package = "gstreamer-video", version = "0.24.5", features = ["v1_28"] }
