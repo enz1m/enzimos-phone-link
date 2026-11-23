@@ -302,18 +302,44 @@ fn free_space(dir: &Path) -> Option<u64> {
     Some(stat.blocks_available() as u64 * stat.fragment_size() as u64)
 }
 
-/// Desktop notification for a received file, with Open / Show in Folder.
+fn received_description(path: &Path, device_name: &str) -> String {
+    fn label(value: &str, limit: usize) -> String {
+        // Neutralize markup for servers that interpret the description as HTML.
+        crate::phone_notify::display_text(value, limit, false)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .map(|c| match c {
+                '<' => '‹',
+                '>' => '›',
+                '&' => '＆',
+                c => c,
+            })
+            .collect()
+    }
+
+    let name = path
+        .file_name()
+        .map_or_else(String::new, |name| label(&name.to_string_lossy(), 112));
+    let device = label(device_name, 64);
+    let name = if name.is_empty() { "Received file" } else { &name };
+    let device = if device.is_empty() { "a paired phone" } else { &device };
+    format!("{name}\nFrom {device}")
+}
+
+/// Shows a received file with Open and Show in Folder actions. Clicking the card reveals the file.
 pub fn notify_received(path: PathBuf, device_name: String) {
     tokio::spawn(async move {
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let Ok(output) = tokio::process::Command::new("notify-send")
-            .arg("--app-name=enzimOS Remote")
+            .arg("--app-name=Phone Link")
             .arg("--icon=document-save")
+            .arg("--action=default=Show in Folder")
             .arg("--action=open=Open")
             .arg("--action=folder=Show in Folder")
             .arg("--wait")
-            .arg(format!("Received {name}"))
-            .arg(format!("From {device_name}, saved to Downloads."))
+            .arg("File received")
+            .arg(received_description(&path, &device_name))
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
@@ -326,7 +352,7 @@ pub fn notify_received(path: PathBuf, device_name: String) {
             "open" => {
                 let _ = tokio::process::Command::new("xdg-open").arg(&path).spawn();
             }
-            "folder" => show_in_folder(&path).await,
+            "default" | "folder" => show_in_folder(&path).await,
             _ => {}
         }
     });
@@ -377,6 +403,16 @@ mod tests {
         assert_eq!(safe_file_name("  "), "file");
         assert_eq!(safe_file_name("a\nb.jpg"), "a_b.jpg");
         assert!(safe_file_name(&"x".repeat(400)).len() <= 200);
+    }
+
+    #[test]
+    fn received_file_displays_a_bounded_literal_label() {
+        let path = PathBuf::from(format!("/custom location/{}<a>.jpg", "é".repeat(110)));
+        let description = received_description(&path, "Photo\n<Phone> & Tablet\u{202e}");
+        assert_eq!(
+            description,
+            format!("{}‹…\nFrom Photo ‹Phone› ＆ Tablet", "é".repeat(110))
+        );
     }
 
     #[test]
