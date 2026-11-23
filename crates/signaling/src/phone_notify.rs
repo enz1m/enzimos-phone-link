@@ -46,6 +46,7 @@ struct Shown {
 pub struct PhoneNotifications {
     proxy: zbus::Proxy<'static>,
     inline_reply: bool,
+    body_markup: bool,
     shown: Mutex<HashMap<u32, Shown>>,
     ids: Mutex<HashMap<(String, String), u32>>,
     to_phone: UnboundedSender<(String, HostMessage)>,
@@ -88,6 +89,7 @@ impl PhoneNotifications {
         let this = Arc::new(Self {
             proxy,
             inline_reply: capabilities.iter().any(|c| c == "inline-reply"),
+            body_markup: capabilities.iter().any(|c| c == "body-markup"),
             shown: Mutex::new(HashMap::new()),
             ids: Mutex::new(HashMap::new()),
             to_phone,
@@ -131,12 +133,16 @@ impl PhoneNotifications {
         let replaces = self.ids.lock().unwrap_or_else(|e| e.into_inner()).get(&(device_id.into(), n.key.into())).copied().unwrap_or(0);
         let mut actions: Vec<String> = Vec::new();
         for action in n.actions {
+            let label = display_text(&action.title, 79, false);
             if action.reply && self.inline_reply {
-                actions.extend(["inline-reply".into(), action.title.clone()]);
+                actions.extend(["inline-reply".into(), label]);
             } else if action.reply {
-                actions.extend([format!("{REPLY_PREFIX}{}", action.id), format!("{}…", action.title)]);
+                actions.extend([
+                    format!("{REPLY_PREFIX}{}", action.id),
+                    format!("{label}…"),
+                ]);
             } else {
-                actions.extend([action.id.clone(), action.title.clone()]);
+                actions.extend([action.id.clone(), label]);
             }
         }
         if is_sms_app(n.app_name)
@@ -146,15 +152,39 @@ impl PhoneNotifications {
             actions.extend([OPEN_MESSAGES.to_string(), "Open in Messages".to_string()]);
         }
         let mut hints: HashMap<&str, Value<'_>> = HashMap::new();
+        // Match the Shell's 80-character attribution limit.
+        let device = display_text(n.device_name, 31, false);
+        let app = display_text(n.app_name, 46, false);
         hints.insert("category", Value::from("im.received"));
-        hints.insert("x-kde-origin-name", Value::from(n.device_name.to_string()));
+        hints.insert("x-kde-origin-name", Value::from(device.clone()));
         if let Some(image) = n.icon.and_then(image_data) {
             hints.insert("image-data", image);
         }
-        let app_name = if n.app_name.is_empty() { n.device_name.to_string() } else { format!("{} · {}", n.app_name, n.device_name) };
+        let app_name = match (app.is_empty(), device.is_empty()) {
+            (true, _) => device,
+            (false, true) => app,
+            (false, false) => format!("{app} · {device}"),
+        };
+        let title = display_text(n.title, 256, false);
+        let mut body = display_text(n.text, 4096, true);
+        if self.body_markup {
+            body = escape(&body);
+        }
         let id: u32 = self
             .proxy
-            .call("Notify", &(app_name.as_str(), replaces, "phone", n.title, escape(n.text).as_str(), actions, hints, -1i32))
+            .call(
+                "Notify",
+                &(
+                    app_name.as_str(),
+                    replaces,
+                    "phone",
+                    title.as_str(),
+                    body.as_str(),
+                    actions,
+                    hints,
+                    -1i32,
+                ),
+            )
             .await
             .map_err(|e| e.to_string())?;
         self.ids.lock().unwrap_or_else(|e| e.into_inner()).insert((device_id.into(), n.key.into()), id);
@@ -240,6 +270,32 @@ impl PhoneNotifications {
     }
 }
 
+pub(crate) fn display_text(value: &str, limit: usize, multiline: bool) -> String {
+    let mut printable = value
+        .trim()
+        .chars()
+        .filter(|c| {
+            !matches!(
+                *c,
+                '\u{200b}' | '\u{200e}'..='\u{200f}' | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}' | '\u{feff}'
+            )
+        })
+        .map(|c| {
+            if c.is_control() && !(multiline && matches!(c, '\n' | '\t')) {
+                ' '
+            } else {
+                c
+            }
+        });
+    let mut text: String = printable.by_ref().take(limit).collect();
+    if printable.next().is_some() {
+        text.pop();
+        text.push('…');
+    }
+    text
+}
+
 /// Reply text from a small dialog (servers without inline reply).
 async fn ask_reply(title: &str) -> Option<String> {
     let output = tokio::process::Command::new("zenity")
@@ -285,7 +341,14 @@ mod tests {
         }
     }
 
-    struct Desktop;
+    struct Notice {
+        app: String,
+        summary: String,
+        body: String,
+        actions: Vec<String>,
+    }
+
+    struct Desktop(tokio::sync::mpsc::UnboundedSender<Notice>);
     #[zbus::interface(name = "org.freedesktop.Notifications")]
     impl Desktop {
         fn get_capabilities(&self) -> Vec<&str> {
@@ -294,15 +357,23 @@ mod tests {
         #[allow(clippy::too_many_arguments, reason = "The freedesktop notification method has a fixed wire signature")]
         fn notify(
             &self,
-            _app: &str,
+            app: &str,
             replaces: u32,
             _icon: &str,
-            _summary: &str,
-            _body: &str,
-            _actions: Vec<String>,
+            summary: &str,
+            body: &str,
+            actions: Vec<String>,
             _hints: HashMap<String, zbus::zvariant::OwnedValue>,
             _timeout: i32,
         ) -> u32 {
+            self.0
+                .send(Notice {
+                    app: app.into(),
+                    summary: summary.into(),
+                    body: body.into(),
+                    actions,
+                })
+                .unwrap();
             replaces.max(1)
         }
     }
@@ -328,11 +399,12 @@ mod tests {
             .read_line(&mut address)
             .unwrap();
         let _bus = Bus(child);
+        let (notice_sink, mut notices) = tokio::sync::mpsc::unbounded_channel();
         let desktop = zbus::connection::Builder::address(address.trim())
             .unwrap()
             .name(DEST)
             .unwrap()
-            .serve_at(PATH, Desktop)
+            .serve_at(PATH, Desktop(notice_sink))
             .unwrap()
             .build()
             .await
@@ -347,7 +419,7 @@ mod tests {
         let actions = vec![
             NotificationAction {
                 id: "done".into(),
-                title: "Done".into(),
+                title: "Done".repeat(30),
                 reply: false,
             },
             NotificationAction {
@@ -356,23 +428,40 @@ mod tests {
                 reply: true,
             },
         ];
+        let device = "QA phone ".repeat(8);
+        let app = "QA app ".repeat(8);
+        let title = "Synthetic ".repeat(60);
+        let text = format!("<tag> & {}", "Fixture ".repeat(900));
         for sequence in 0..64 {
             let key = format!("fixture-{sequence}");
             notifications
                 .show(
                     "phone",
                     Incoming {
-                        device_name: "QA phone",
+                        device_name: &device,
                         key: &key,
-                        app_name: "QA fixture",
-                        title: "Synthetic",
-                        text: "Fixture",
+                        app_name: &app,
+                        title: &title,
+                        text: &text,
                         icon: None,
                         actions: &actions,
                     },
                 )
                 .await
                 .unwrap();
+            let notice = timeout(Duration::from_secs(3), notices.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if sequence == 0 {
+                assert_eq!(notice.app.chars().count(), 80);
+                assert_eq!(notice.summary.chars().count(), 256);
+                assert_eq!(notice.body.chars().count(), 4096);
+                assert!(notice.body.starts_with("<tag> & "));
+                assert_eq!(notice.actions[0], "done");
+                assert!(notice.actions[1].chars().count() <= 80);
+                assert_eq!(notice.actions[2], "inline-reply");
+            }
             if sequence % 2 == 0 {
                 desktop
                     .emit_signal(
