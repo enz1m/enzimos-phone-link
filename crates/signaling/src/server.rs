@@ -532,9 +532,12 @@ pub struct ServerState {
     config: ServerConfig,
     /// Server start time for uptime calculation.
     started_at: std::time::Instant,
-    /// Semaphore that limits concurrent connections (acquired before
-    /// WebSocket handshake, released on disconnect).
+    /// Limits authenticated connections; a permit is taken when hello succeeds.
     connection_semaphore: Arc<Semaphore>,
+    /// Limits connections that have not authenticated yet.
+    handshake_semaphore: Arc<Semaphore>,
+    /// Unauthenticated connections per remote address.
+    unauthenticated: Arc<std::sync::Mutex<HashMap<std::net::IpAddr, usize>>>,
     /// Server hostname for probe responses.
     hostname: Option<String>,
     /// Server-wide metrics (atomic, lock-free).
@@ -667,6 +670,8 @@ impl ServerState {
             config,
             started_at: std::time::Instant::now(),
             connection_semaphore: sem,
+            handshake_semaphore: Arc::new(Semaphore::new(MAX_UNAUTHENTICATED)),
+            unauthenticated: Arc::default(),
             hostname: hostname::get().ok().and_then(|h| h.into_string().ok()),
             metrics: ServerMetrics::new(),
             webrtc_bridge: crate::webrtc_bridge::WebRtcBridge::new(webrtc_binary, socket_dir),
@@ -1050,6 +1055,26 @@ impl ServerState {
         self.connections.lock().await.contains_key(device_id)
     }
 
+    /// Reserve an unauthenticated connection for `peer`, or `None` when its limit is reached.
+    fn admit(&self, peer: SocketAddr) -> Option<Admission> {
+        let permit = self.handshake_semaphore.clone().try_acquire_owned().ok()?;
+        // Loopback serves local tooling and adb-forwarded phones.
+        let ip = (!peer.ip().is_loopback()).then(|| peer.ip());
+        if let Some(ip) = ip {
+            let mut counts = self.unauthenticated.lock().unwrap_or_else(|e| e.into_inner());
+            let count = counts.entry(ip).or_default();
+            if *count >= MAX_UNAUTHENTICATED_PER_IP {
+                return None;
+            }
+            *count += 1;
+        }
+        Some(Admission {
+            counts: Arc::clone(&self.unauthenticated),
+            ip,
+            _permit: permit,
+        })
+    }
+
     /// Whether every hello must present a paired credential.
     fn auth_required(&self, peer: SocketAddr) -> bool {
         if !self.config.auth_token.is_empty() {
@@ -1203,75 +1228,13 @@ pub async fn run(state: Arc<ServerState>) -> Result<(), SignalingError> {
                     }
                 };
 
-                state.metrics.total_connections.fetch_add(1, Ordering::Relaxed);
-
-                // Acquire a connection slot before the handshake. The permit
-                // is held for the entire connection lifetime and released on
-                // disconnect, preventing the TOCTOU gap of count-then-spawn.
-                let permit = match state.connection_semaphore.clone().try_acquire_owned() {
-                    Ok(permit) => permit,
-                    Err(_) => {
-                        audit::log_connection_rejected(peer);
-                        drop(stream);
-                        continue;
-                    }
-                };
-
-                let state = Arc::clone(&state);
-
-                #[cfg(feature = "tls")]
-                let tls_acceptor = tls_acceptor.clone();
-
-                tokio::spawn(async move {
-                    let result = {
-                        #[cfg(feature = "tls")]
-                        {
-                            // One port serves both: TLS for phones, plaintext
-                            // only for loopback tooling (status, adb reverse)
-                            // unless LAN plaintext is explicitly allowed.
-                            let wants_tls = tls_acceptor.is_some() && {
-                                let mut first = [0u8; 1];
-                                matches!(
-                                    tokio::time::timeout(std::time::Duration::from_secs(5), stream.peek(&mut first)).await,
-                                    Ok(Ok(1))
-                                ) && first[0] == 0x16
-                            };
-                            if tls_acceptor.is_some()
-                                && !wants_tls
-                                && !peer.ip().is_loopback()
-                                && !state.config.allow_lan_plaintext
-                            {
-                                audit::log_connection_rejected(peer);
-                                Err(SignalingError::ConnectionError(
-                                    "plaintext connection refused; use TLS".into(),
-                                ))
-                            } else if let (true, Some(acceptor)) = (wants_tls, tls_acceptor.as_ref()) {
-                                match acceptor.accept(stream).await {
-                                    Ok(tls_stream) => {
-                                        handle_connection_tls(state, tls_stream, peer).await
-                                    }
-                                    Err(e) => Err(SignalingError::ConnectionError(
-                                        format!("TLS handshake failed: {e}"),
-                                    )),
-                                }
-                            } else {
-                                handle_connection(state, stream, peer).await
-                            }
-                        }
-                        #[cfg(not(feature = "tls"))]
-                        {
-                            handle_connection(state, stream, peer).await
-                        }
-                    };
-                    // The permit is dropped here, releasing the connection slot.
-                    drop(permit);
-                    if let Err(error) = result {
-                        AuditEntry::new(AuditEvent::Disconnect)
-                            .peer(peer)
-                            .kv("reason", &error.to_string())
-                            .emit();
-                    }
-                });
+                accept_connection(
+                    &state,
+                    stream,
+                    peer,
+                    #[cfg(feature = "tls")]
+                    tls_acceptor.clone(),
+                );
             }
             // Session garbage collection timer.
             _ = async {
@@ -1318,29 +1281,143 @@ pub async fn run(state: Arc<ServerState>) -> Result<(), SignalingError> {
     Ok(())
 }
 
-#[cfg(feature = "tls")]
-async fn handle_connection_tls(
-    state: Arc<ServerState>,
-    stream: tokio_rustls::server::TlsStream<TcpStream>,
-    peer: SocketAddr,
-) -> Result<(), SignalingError> {
-    let ws = tokio_tungstenite::accept_async_with_config(stream, Some(ws_config()))
-        .await
-        .map_err(|e| SignalingError::ConnectionError(format!("WebSocket handshake failed: {e}")))?;
+/// Time a new connection has for TLS, the WebSocket upgrade and hello.
+const HANDSHAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+/// Unauthenticated connections allowed from one non-loopback address.
+const MAX_UNAUTHENTICATED_PER_IP: usize = 4;
+/// Unauthenticated connections allowed in total.
+const MAX_UNAUTHENTICATED: usize = 32;
 
-    handle_ws(state, ws, peer, true).await
+/// An unauthenticated connection's reservation, released on drop.
+struct Admission {
+    counts: Arc<std::sync::Mutex<HashMap<std::net::IpAddr, usize>>>,
+    ip: Option<std::net::IpAddr>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
+impl Drop for Admission {
+    fn drop(&mut self) {
+        let Some(ip) = self.ip else { return };
+        let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = counts.get_mut(&ip) {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(&ip);
+            }
+        }
+    }
+}
+
+struct Handshake {
+    deadline: tokio::time::Instant,
+    admission: Option<Admission>,
+}
+
+impl Handshake {
+    fn new(admission: Option<Admission>) -> Self {
+        Self {
+            deadline: tokio::time::Instant::now() + HANDSHAKE_DEADLINE,
+            admission,
+        }
+    }
+}
+
+fn accept_connection(
+    state: &Arc<ServerState>,
+    stream: TcpStream,
+    peer: SocketAddr,
+    #[cfg(feature = "tls")] tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+) {
+    state
+        .metrics
+        .total_connections
+        .fetch_add(1, Ordering::Relaxed);
+    let Some(admission) = state.admit(peer) else {
+        audit::log_connection_rejected(peer, "handshake_limit");
+        return;
+    };
+    let handshake = Handshake::new(Some(admission));
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        let result = {
+            #[cfg(feature = "tls")]
+            {
+                // One port serves both: TLS for phones, plaintext only for
+                // loopback tooling (status, adb reverse) unless LAN plaintext is
+                // explicitly allowed.
+                let wants_tls = tls_acceptor.is_some() && {
+                    let mut first = [0u8; 1];
+                    matches!(
+                        tokio::time::timeout_at(handshake.deadline, stream.peek(&mut first)).await,
+                        Ok(Ok(1))
+                    ) && first[0] == 0x16
+                };
+                if tls_acceptor.is_some()
+                    && !wants_tls
+                    && !peer.ip().is_loopback()
+                    && !state.config.allow_lan_plaintext
+                {
+                    audit::log_connection_rejected(peer, "plaintext");
+                    Err(SignalingError::ConnectionError(
+                        "plaintext connection refused; use TLS".into(),
+                    ))
+                } else if let (true, Some(acceptor)) = (wants_tls, tls_acceptor.as_ref()) {
+                    match tokio::time::timeout_at(handshake.deadline, acceptor.accept(stream)).await
+                    {
+                        Ok(Ok(tls_stream)) => {
+                            handle_stream(state, tls_stream, peer, true, handshake).await
+                        }
+                        Ok(Err(e)) => Err(SignalingError::ConnectionError(format!(
+                            "TLS handshake failed: {e}"
+                        ))),
+                        Err(_) => Err(SignalingError::HelloTimeout),
+                    }
+                } else {
+                    handle_stream(state, stream, peer, false, handshake).await
+                }
+            }
+            #[cfg(not(feature = "tls"))]
+            {
+                handle_stream(state, stream, peer, false, handshake).await
+            }
+        };
+        if let Err(error) = result {
+            AuditEntry::new(AuditEvent::Disconnect)
+                .peer(peer)
+                .kv("reason", &error.to_string())
+                .emit();
+        }
+    });
+}
+
+async fn handle_stream<S>(
+    state: Arc<ServerState>,
+    stream: S,
+    peer: SocketAddr,
+    tls: bool,
+    handshake: Handshake,
+) -> Result<(), SignalingError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let ws = tokio::time::timeout_at(
+        handshake.deadline,
+        tokio_tungstenite::accept_async_with_config(stream, Some(ws_config())),
+    )
+    .await
+    .map_err(|_| SignalingError::HelloTimeout)?
+    .map_err(|e| SignalingError::ConnectionError(format!("WebSocket handshake failed: {e}")))?;
+
+    handle_ws(state, ws, peer, tls, handshake).await
+}
+
+#[cfg(test)]
 async fn handle_connection(
     state: Arc<ServerState>,
     stream: TcpStream,
     peer: SocketAddr,
 ) -> Result<(), SignalingError> {
-    let ws = tokio_tungstenite::accept_async_with_config(stream, Some(ws_config()))
-        .await
-        .map_err(|e| SignalingError::ConnectionError(format!("WebSocket handshake failed: {e}")))?;
-
-    handle_ws(state, ws, peer, false).await
+    handle_stream(state, stream, peer, false, Handshake::new(None)).await
 }
 
 async fn handle_ws<S>(
@@ -1348,21 +1425,25 @@ async fn handle_ws<S>(
     ws: tokio_tungstenite::WebSocketStream<S>,
     peer: SocketAddr,
     tls: bool,
+    handshake: Handshake,
 ) -> Result<(), SignalingError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    let Handshake {
+        deadline,
+        admission,
+    } = handshake;
     if !*state.session_access.borrow() {
         return Err(SignalingError::AuthenticationFailed("Unlock the computer to connect a phone".into()));
     }
     let (mut sink, mut source) = ws.split();
     audit::log_connect(peer);
 
-    // Expect a Hello message first.
-    let hello_deadline = tokio::time::sleep(std::time::Duration::from_secs(5));
+    let hello_deadline = tokio::time::sleep_until(deadline);
     tokio::pin!(hello_deadline);
 
-    let (device_id, (evict_rx, revoked, outbox_rx)) = loop {
+    let (device_id, _connection_slot, (evict_rx, revoked, outbox_rx)) = loop {
         tokio::select! {
             message = source.next() => {
                 let Some(message) = message else {
@@ -1465,6 +1546,20 @@ where
                                         ));
                                     }
                                 }
+                                let Ok(connection_slot) = state.connection_semaphore.clone().try_acquire_owned() else {
+                                    let reject = HostMessage::HelloReject {
+                                        v: protocol::PROTOCOL_VERSION,
+                                        reason: "too many phones are connected to this computer".into(),
+                                        code: Some("busy".into()),
+                                    };
+                                    let json = serde_json::to_string(&reject)
+                                        .map_err(|e| SignalingError::Serialization(e.to_string()))?;
+                                    let _ = sink.send(Message::Text(json.into())).await;
+                                    audit::log_connection_rejected(peer, "max_connections");
+                                    return Err(SignalingError::ConnectionError(
+                                        "connection limit reached".into(),
+                                    ));
+                                };
                                 // Atomically check for duplicates and register.
                                 // If a stale connection exists with the same
                                 // device_id, evict it (the old message loop
@@ -1543,7 +1638,7 @@ where
                                         format!("could not send hello ack: {e}"),
                                     ));
                                 }
-                                break (device_id, evict_rx_and_revoked);
+                                break (device_id, connection_slot, evict_rx_and_revoked);
                             }
                             Ok(_) => {
                                 let error = HostMessage::Error {
@@ -1598,6 +1693,7 @@ where
         }
     };
 
+    drop(admission);
     // Connection was already registered atomically during hello handling.
     audit::log_authenticate(&device_id, peer);
 
@@ -4307,6 +4403,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn half_open_connections_cannot_take_phone_slots() {
+        let config = ServerConfig {
+            ping_interval_secs: 0,
+            max_connections: 1,
+            ..Default::default()
+        };
+        let state = ServerState::new(config);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            loop {
+                let (stream, peer) = listener.accept().await.unwrap();
+                accept_connection(
+                    &server_state,
+                    stream,
+                    peer,
+                    #[cfg(feature = "tls")]
+                    None,
+                );
+            }
+        });
+
+        let mut half_open = Vec::new();
+        for _ in 0..4 {
+            half_open.push(TcpStream::connect(addr).await.unwrap());
+        }
+
+        let url = format!("ws://{addr}");
+        let (mut phone, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        phone
+            .send(Message::Text(
+                r#"{"type":"hello","v":1,"device_id":"phone","token":"t"}"#.into(),
+            ))
+            .await
+            .unwrap();
+        let Some(Ok(Message::Text(ack))) = phone.next().await else {
+            panic!("no hello reply")
+        };
+        assert!(matches!(
+            serde_json::from_str(&ack).unwrap(),
+            HostMessage::HelloAck { .. }
+        ));
+
+        let (mut second, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        second
+            .send(Message::Text(
+                r#"{"type":"hello","v":1,"device_id":"second","token":"t"}"#.into(),
+            ))
+            .await
+            .unwrap();
+        let Some(Ok(Message::Text(reject))) = second.next().await else {
+            panic!("no hello reply")
+        };
+        assert!(matches!(
+            serde_json::from_str(&reject).unwrap(),
+            HostMessage::HelloReject { .. }
+        ));
+
+        for mut stream in half_open {
+            let mut buf = [0u8; 1];
+            let closed = tokio::time::timeout(
+                HANDSHAKE_DEADLINE + std::time::Duration::from_secs(3),
+                tokio::io::AsyncReadExt::read(&mut stream, &mut buf),
+            )
+            .await
+            .expect("half-open connection outlived the handshake deadline");
+            assert!(matches!(closed, Ok(0) | Err(_)));
+        }
+    }
+
+    #[test]
+    fn unauthenticated_connections_are_limited_per_address() {
+        let state = ServerState::new(ServerConfig::default());
+        let peer = |ip: [u8; 4]| SocketAddr::from((ip, 40000));
+        let mut held: Vec<_> = (0..MAX_UNAUTHENTICATED_PER_IP)
+            .map(|_| state.admit(peer([192, 168, 1, 20])).expect("within limit"))
+            .collect();
+        assert!(state.admit(peer([192, 168, 1, 20])).is_none());
+        assert!(state.admit(peer([192, 168, 1, 21])).is_some());
+        held.pop();
+        assert!(state.admit(peer([192, 168, 1, 20])).is_some());
+        let loopback: Vec<_> = (0..MAX_UNAUTHENTICATED_PER_IP + 1)
+            .map(|_| state.admit(peer([127, 0, 0, 1])))
+            .collect();
+        assert!(loopback.iter().all(Option::is_some));
+    }
+
+    #[tokio::test]
     async fn hello_timeout_closes_connection() {
         let config = ServerConfig {
             ping_interval_secs: 0,
@@ -4326,9 +4511,11 @@ mod tests {
         let url = format!("ws://{addr}");
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
 
-        // Don't send hello — wait for the server to time out (5s).
-        // The server should close with a Policy close frame.
-        let result = tokio::time::timeout(std::time::Duration::from_secs(7), ws.next()).await;
+        let result = tokio::time::timeout(
+            HANDSHAKE_DEADLINE + std::time::Duration::from_secs(3),
+            ws.next(),
+        )
+        .await;
 
         match result {
             Ok(Some(Ok(Message::Close(Some(frame))))) => {

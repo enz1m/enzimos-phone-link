@@ -227,10 +227,10 @@ pub fn log_session_stop(device_id: &str, session_id: &str) {
 }
 
 /// Convenience: emit a connection rejected event.
-pub fn log_connection_rejected(peer: SocketAddr) {
+pub fn log_connection_rejected(peer: SocketAddr, reason: &str) {
     AuditEntry::new(AuditEvent::ConnectionRejected)
         .peer(peer)
-        .kv("reason", "max_connections")
+        .kv("reason", reason)
         .emit();
 }
 
