@@ -3366,20 +3366,19 @@ async fn handle_client_message(
                 let eval_cmd = format!(
                     "hl.monitor({{ output = \"\", mode = \"{mode}\", position = \"0x0\", scale = 1 }})"
                 );
-                match tokio::process::Command::new("hyprctl")
-                    .args(["--instance", &instance, "eval", &eval_cmd])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .await
-                {
-                    Ok(status) if !status.success() => {
-                        eprintln!("warning: hyprctl resize failed with exit code: {status}");
-                    }
-                    Err(e) => {
-                        eprintln!("warning: hyprctl resize failed: {e}");
-                    }
-                    _ => {}
+                let resized = tokio::task::spawn_blocking(move || {
+                    let compositor =
+                        enzremote_webrtc_ipc::compositor::Compositor::for_instance(&instance)?;
+                    compositor.command(
+                        &format!("eval {eval_cmd}"),
+                        std::time::Duration::from_secs(5),
+                    )
+                })
+                .await;
+                match resized {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => eprintln!("warning: compositor resize failed: {e}"),
+                    Err(e) => eprintln!("warning: compositor resize failed: {e}"),
                 }
             }
 

@@ -2,6 +2,10 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use enzremote_webrtc_ipc::compositor::{Compositor, Error as CompositorError};
+
+const CONTROL_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Maximizing a main window hides floating windows; refocus open dialogs,
 /// most recent last, so they stay above it (Lua, expects `floats`).
 const RAISE_FLOATING: &str = "table.sort(floats, function(a, b) return a.focus_history_id > b.focus_history_id end); for _, w in ipairs(floats) do hl.dispatch(hl.dsp.focus({ window = \"address:\" .. w.address })) end;";
@@ -99,7 +103,7 @@ impl ContentViewport {
         if self.lease_helper.is_some() {
             return self.apply(self.width, self.height);
         }
-        let monitors: serde_json::Value = serde_json::from_str(&self.control(&["-j", "monitors"])?)
+        let monitors: serde_json::Value = serde_json::from_str(&self.monitors()?)
             .map_err(|_| "invalid content resize monitor description")?;
         if !self.matches_canvas(&monitors) {
             return Err("content resize requires a matching single-output canvas".into());
@@ -143,7 +147,7 @@ impl ContentViewport {
     }
 
     fn live_scale(&self) -> Option<f64> {
-        let monitors: serde_json::Value = serde_json::from_str(&self.control(&["-j", "monitors"]).ok()?).ok()?;
+        let monitors: serde_json::Value = serde_json::from_str(&self.monitors().ok()?).ok()?;
         self.matches_canvas(&monitors).then(|| monitors[0]["scale"].as_f64()).flatten()
     }
 
@@ -168,16 +172,30 @@ impl ContentViewport {
     }
 
     fn eval(&self, code: &str) -> Result<(), String> {
-        if self.control(&["eval", code])?.trim() != "ok" {
+        let code = format!("eval {code}");
+        let reply = self.control(|compositor| compositor.command(&code, CONTROL_TIMEOUT))?;
+        if reply.trim() != "ok" {
             return Err("compositor rejected content resize".into());
         }
         Ok(())
     }
 
-    fn control(&self, arguments: &[&str]) -> Result<String, String> {
-        let mut command = Command::new("hyprctl");
-        command.args(["-i", &self.instance]).args(arguments);
-        Self::run_command(command)
+    fn monitors(&self) -> Result<String, String> {
+        self.control(|compositor| compositor.query_json("monitors", CONTROL_TIMEOUT))
+    }
+
+    fn control(
+        &self,
+        request: impl FnOnce(&Compositor) -> Result<String, CompositorError>,
+    ) -> Result<String, String> {
+        let compositor = Compositor::for_instance(&self.instance)
+            .map_err(|e| format!("content resize control unavailable: {e}"))?;
+        request(&compositor).map_err(|error| match error {
+            CompositorError::Unavailable(e) => format!("content resize control unavailable: {e}"),
+            CompositorError::TimedOut => "content resize control timed out".into(),
+            CompositorError::Rejected(_) => "compositor rejected content resize".into(),
+            CompositorError::InvalidReply => "invalid compositor response".into(),
+        })
     }
 
     fn run_command(mut command: Command) -> Result<String, String> {
@@ -186,7 +204,7 @@ impl ContentViewport {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| format!("content resize control unavailable: {e}"))?;
-        let deadline = Instant::now() + Duration::from_millis(500);
+        let deadline = Instant::now() + CONTROL_TIMEOUT;
         loop {
             match child.try_wait() {
                 Ok(Some(_)) => break,

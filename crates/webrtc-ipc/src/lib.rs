@@ -81,4 +81,5 @@ mod tests {
     }
 }
 
+pub mod compositor;
 pub mod layout;

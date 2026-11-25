@@ -12,6 +12,9 @@ use std::sync::{Arc, Mutex};
 use crate::input_bridge::InputBridge;
 use crate::ipc::FromWebRtc;
 use crate::wayland_input::WaylandInputBridge;
+use enzremote_webrtc_ipc::compositor::Compositor;
+
+const COMPOSITOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn borrowed_desktop_control_allowed(message: &enzremote_control::ControlMessage) -> bool {
     use enzremote_control::ControlMessage::*;
@@ -2295,42 +2298,30 @@ impl WebRtcPipeline {
     /// Queries the Hyprland compositor for running windows and sends
     /// the result back via the data channel.
     fn handle_list_windows(&self) {
-        // Query Hyprland via hyprctl if the instance is available.
         let instance = std::env::var("ENZREMOTE_HYPRLAND_INSTANCE").unwrap_or_default();
         if instance.is_empty() {
             eprintln!("webrtc-server: list_windows: no compositor instance");
             return;
         }
-        let output = std::process::Command::new("hyprctl")
-            .args(["--instance", &instance, "-j", "clients"])
-            .output();
-        match output {
-            Ok(out) if out.status.success() => {
-                let raw_json = String::from_utf8_lossy(&out.stdout);
+        match Compositor::for_instance(&instance)
+            .and_then(|compositor| compositor.query_json("clients", COMPOSITOR_TIMEOUT))
+        {
+            Ok(raw_json) => {
                 eprintln!("webrtc-server: list_windows: {} bytes", raw_json.len());
-                // Wrap the hyprctl response in our protocol envelope.
                 let response = format!(
                     r#"{{"type":"window_list","v":1,"windows":{}}}"#,
                     raw_json.trim()
                 );
                 self.send_to_client(&response);
             }
-            Ok(out) => {
-                eprintln!(
-                    "webrtc-server: hyprctl clients failed: {}",
-                    String::from_utf8_lossy(&out.stderr)
-                );
-            }
-            Err(e) => {
-                eprintln!("webrtc-server: hyprctl not available: {e}");
-            }
+            Err(e) => eprintln!("webrtc-server: compositor clients query failed: {e}"),
         }
     }
 
     /// Handle a request to focus a specific window.
     ///
-    /// Sends a focus + fullscreen command to the Hyprland compositor via
-    /// `hyprctl eval` (Lua API). Uses `focuswindow` dispatch then
+    /// Sends a focus + fullscreen command to the Hyprland compositor as a
+    /// Lua `eval` request. Uses `focuswindow` dispatch then
     /// maximizes the window so it fills the mobile viewport.
     /// `window_address` is pre-validated to hex-only by `enzremote_control`.
     fn handle_focus_window(&self, window_address: &str) {
@@ -2349,33 +2340,24 @@ impl WebRtcPipeline {
             eprintln!("webrtc-server: focus_window: invalid address: {window_address}");
             return;
         }
-        // Use hyprctl eval with Lua API. Dispatchers in this Hyprland
-        // build are lazy objects that must be wrapped with hl.dispatch().
+        // Dispatchers in this Hyprland build are lazy objects that must be
+        // wrapped with hl.dispatch().
         // First focus the window, then fullscreen it to fill the viewport.
         let eval_cmd = format!(
             "hl.dispatch(hl.dsp.focus({{ window = \"address:{window_address}\" }})) \
              hl.dispatch(hl.dsp.window.fullscreen())"
         );
-        let result = std::process::Command::new("hyprctl")
-            .args(["--instance", &instance, "eval", &eval_cmd])
-            .output();
-        match result {
-            Ok(out) if out.status.success() => {
-                eprintln!("webrtc-server: focused window {window_address}");
-            }
-            Ok(out) => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                eprintln!("webrtc-server: focus_window response: {}", stdout.trim());
-            }
-            Err(e) => {
-                eprintln!("webrtc-server: hyprctl not available: {e}");
-            }
+        match Compositor::for_instance(&instance).and_then(|compositor| {
+            compositor.command(&format!("eval {eval_cmd}"), COMPOSITOR_TIMEOUT)
+        }) {
+            Ok(_) => eprintln!("webrtc-server: focused window {window_address}"),
+            Err(e) => eprintln!("webrtc-server: focus_window failed: {e}"),
         }
     }
 
     /// Handle an in-band resize request from the client (issue #24).
     ///
-    /// Resizes the nested Hyprland compositor viewport via `hyprctl eval`,
+    /// Resizes the nested Hyprland compositor viewport with a Lua `eval`,
     /// adjusts the ABR bitrate ceiling proportionally, and requests a
     /// keyframe so the client can decode immediately at the new resolution.
     ///
@@ -2404,12 +2386,10 @@ impl WebRtcPipeline {
         let eval_cmd = format!(
             "hl.monitor({{ output = \"\", mode = \"{width}x{height}\", position = \"0x0\", scale = 1 }})"
         );
-        match std::process::Command::new("hyprctl")
-            .args(["--instance", &instance, "eval", &eval_cmd])
-            .output()
-        {
-            Ok(out) if out.status.success() => {
-                let response = String::from_utf8_lossy(&out.stdout);
+        match Compositor::for_instance(&instance).and_then(|compositor| {
+            compositor.command(&format!("eval {eval_cmd}"), COMPOSITOR_TIMEOUT)
+        }) {
+            Ok(response) => {
                 if response.trim() == "ok" {
                     eprintln!("webrtc-server: compositor resized to {width}x{height}");
                 } else {
@@ -2419,15 +2399,8 @@ impl WebRtcPipeline {
                     );
                 }
             }
-            Ok(out) => {
-                eprintln!(
-                    "webrtc-server: resize hyprctl failed: {}",
-                    String::from_utf8_lossy(&out.stderr)
-                );
-                return;
-            }
             Err(e) => {
-                eprintln!("webrtc-server: hyprctl not available for resize: {e}");
+                eprintln!("webrtc-server: compositor resize failed: {e}");
                 return;
             }
         }
@@ -2591,15 +2564,10 @@ impl WebRtcPipeline {
 
     /// Find a compositor window by WM class, returning its address if found.
     fn find_window_by_class(&self, instance: &str, wm_class: &str) -> Option<String> {
-        let output = std::process::Command::new("hyprctl")
-            .args(["--instance", instance, "-j", "clients"])
-            .output()
+        let clients = Compositor::for_instance(instance)
+            .and_then(|compositor| compositor.query_json("clients", COMPOSITOR_TIMEOUT))
             .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        // Parse JSON array of clients, find one matching the class.
-        let clients: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+        let clients: serde_json::Value = serde_json::from_str(&clients).ok()?;
         for client in clients.as_array()? {
             let class = client.get("class")?.as_str()?;
             if class.eq_ignore_ascii_case(wm_class) {

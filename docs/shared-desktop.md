@@ -20,6 +20,9 @@ Run the enzimOS Shell session with its matching compositor, portal backend,
 placeholder and snapshot helpers. Enable Phone Link from Settings. The
 installed service uses the desktop's runtime metadata to select the session
 and verifies the compositor identity and control socket before each loan.
+Opening an app sends an `eval` request on the compositor socket from
+`enzremote-signaling`, so the Shell session must list that executable in
+`ENZUI_CONTROL_EXES`.
 
 Named-output capture requires a compatible portal backend. An unavailable
 output or portal fails the request, including when automatic capture source

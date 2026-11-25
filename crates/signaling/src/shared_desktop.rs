@@ -1,3 +1,4 @@
+use enzremote_webrtc_ipc::compositor::{Compositor, Error as CompositorError};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::os::unix::fs::MetadataExt;
@@ -17,7 +18,7 @@ pub struct DesktopTarget {
     pub display: String,
     pub pid: u32,
     pub start_ticks: u64,
-    socket: PathBuf,
+    runtime: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -70,30 +71,39 @@ fn app_window_root(windows: &[DesktopWindow], selected: &DesktopWindow) -> Resul
 impl DesktopTarget {
     pub(crate) async fn output(&self, name: Option<&str>) -> Result<DesktopOutput, String> {
         self.check_process().await?;
-        let mut command = tokio::process::Command::new(
-            enzremote_webrtc_ipc::layout::hyprctl(&self.buildroot),
-        );
-        command
-            .kill_on_drop(true)
-            .args(["-i", &self.instance, "-j", "monitors"])
-            .env("LD_LIBRARY_PATH", self.buildroot.join("prefix/lib"))
-            .stdin(std::process::Stdio::null());
-        let response = tokio::time::timeout(RPC_TIMEOUT, command.output())
+        let response = match self
+            .ask_compositor(|compositor| compositor.query_json("monitors", RPC_TIMEOUT))
             .await
-            .map_err(|_| "Desktop output query timed out")?
-            .map_err(|_| "Desktop output query failed")?;
-        if !response.status.success() || response.stdout.len() > 131_072 {
-            return Err("Invalid desktop output response".into());
-        }
-        let outputs: Vec<DesktopOutput> = serde_json::from_slice(&response.stdout)
-            .map_err(|_| "Invalid desktop output metadata")?;
+        {
+            Ok(response) if response.len() <= 131_072 => response,
+            Err(CompositorError::TimedOut) => return Err("Desktop output query timed out".into()),
+            Err(CompositorError::Unavailable(_)) => {
+                return Err("Desktop output query failed".into());
+            }
+            Ok(_) | Err(_) => return Err("Invalid desktop output response".into()),
+        };
+        let outputs: Vec<DesktopOutput> =
+            serde_json::from_str(&response).map_err(|_| "Invalid desktop output metadata")?;
         let output = select_desktop_output(outputs, name)?;
         self.check_process().await?;
         Ok(output)
     }
 
-    pub(crate) fn control_socket(&self) -> &Path {
-        &self.socket
+    async fn ask_compositor<F>(&self, request: F) -> Result<String, CompositorError>
+    where
+        F: FnOnce(&Compositor) -> Result<String, CompositorError> + Send + 'static,
+    {
+        let compositor = Compositor::in_runtime(&self.runtime, &self.instance)?;
+        tokio::task::spawn_blocking(move || request(&compositor))
+            .await
+            .unwrap_or_else(|error| Err(CompositorError::Unavailable(error.to_string())))
+    }
+
+    pub(crate) fn control_socket(&self) -> PathBuf {
+        self.runtime
+            .join("hypr")
+            .join(&self.instance)
+            .join(".enzremote.sock")
     }
 
     pub(crate) async fn find_or_launch_app(&self, app_id: &str) -> Result<String, String> {
@@ -116,22 +126,17 @@ impl DesktopTarget {
             "return hl.dispatch(hl.dsp.exec_cmd({}))",
             serde_json::to_string(&command).map_err(|error| error.to_string())?
         );
-        let result = tokio::time::timeout(
-            RPC_TIMEOUT,
-            tokio::process::Command::new(
-                enzremote_webrtc_ipc::layout::hyprctl(&self.buildroot),
-            )
-            .kill_on_drop(true)
-            .args(["-i", &self.instance, "eval", &expression])
-            .env("LD_LIBRARY_PATH", self.buildroot.join("prefix/lib"))
-            .stdin(std::process::Stdio::null())
-            .output(),
-        )
-        .await
-        .map_err(|_| "Desktop app launch timed out")?
-        .map_err(|_| "Desktop app launcher failed")?;
-        if !result.status.success() || result.stdout != b"ok\n" {
-            return Err("Desktop rejected app launch".into());
+        let command = format!("eval {expression}");
+        match self
+            .ask_compositor(move |compositor| compositor.command(&command, RPC_TIMEOUT))
+            .await
+        {
+            Ok(reply) if reply == "ok" => {}
+            Err(CompositorError::TimedOut) => return Err("Desktop app launch timed out".into()),
+            Err(CompositorError::Unavailable(_)) => {
+                return Err("Desktop app launcher failed".into());
+            }
+            Ok(_) | Err(_) => return Err("Desktop rejected app launch".into()),
         }
         for _ in 0..80 {
             if let Some(id) = self.find_app(app_id).await? {
@@ -206,7 +211,6 @@ impl DesktopTarget {
             .await?
             .parse::<u64>()
             .map_err(|_| "Invalid desktop start identity")?;
-        let socket = runtime.join("hypr").join(&instance).join(".enzremote.sock");
         Ok(Self {
             runroot: runroot.into(),
             buildroot,
@@ -214,7 +218,7 @@ impl DesktopTarget {
             display,
             pid,
             start_ticks,
-            socket,
+            runtime: runtime.into(),
         })
     }
 
@@ -222,7 +226,7 @@ impl DesktopTarget {
     pub async fn connect(&self) -> Result<DesktopConnection, String> {
         tokio::time::timeout(RPC_TIMEOUT, async {
             self.check_process().await?;
-            let stream = UnixStream::connect(&self.socket)
+            let stream = UnixStream::connect(self.control_socket())
                 .await
                 .map_err(|error| format!("Shared desktop is unavailable: {error}"))?;
             let peer = stream.peer_cred().map_err(|error| error.to_string())?;

@@ -12,6 +12,7 @@
 pub mod eis_broker;
 
 pub mod audio;
+use enzremote_webrtc_ipc::compositor::Compositor;
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -26,6 +27,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const COMPOSITOR_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Current session manifest schema version.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -775,14 +778,8 @@ fn prepare_session_output(state: &SessionState) -> Result<(), String> {
     }
     // A parent Wayland window can be resized independently by the desktop.
     // Keep its rendering backend, but make the app's scanout a headless output.
-    let created = hyprctl_output(
-        state,
-        ["output", "create", "headless", "ENZREMOTE"].map(OsString::from),
-    );
-    if !created
-        .as_ref()
-        .is_ok_and(|v| String::from_utf8_lossy(v).trim() == "ok")
-    {
+    let created = compositor_command(state, "output create headless ENZREMOTE");
+    if !created.as_ref().is_ok_and(|reply| reply.trim() == "ok") {
         if mode == "auto"
             && read_monitors(state)?.as_array().is_some_and(|outputs| {
                 outputs.len() == 1 && outputs[0]["name"].as_str() == original
@@ -884,9 +881,9 @@ fn floating_need(state: &SessionState) -> Result<(u32, u32), String> {
 /// (address, width, height) of mapped, visible floating windows, least
 /// recently focused first.
 fn floating_windows(state: &SessionState) -> Result<Vec<(String, u32, u32)>, String> {
-    let bytes = hyprctl_output(state, [OsString::from("clients"), OsString::from("-j")])?;
-    let clients: Vec<serde_json::Value> = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("hyprctl returned invalid client JSON: {error}"))?;
+    let clients = compositor_query(state, "clients")?;
+    let clients: Vec<serde_json::Value> = serde_json::from_str(&clients)
+        .map_err(|error| format!("compositor returned invalid client JSON: {error}"))?;
     let mut floating: Vec<&serde_json::Value> = clients
         .iter()
         .filter(|c| {
@@ -1015,12 +1012,9 @@ fn await_viewport(
 }
 
 fn submit_viewport_rule(state: &SessionState, code: &str) -> Result<(), String> {
-    let response = hyprctl_output(state, [OsString::from("eval"), OsString::from(code)])?;
-    if String::from_utf8_lossy(&response).trim() != "ok" {
-        return Err(format!(
-            "compositor rejected viewport: {}",
-            String::from_utf8_lossy(&response).trim()
-        ));
+    let response = compositor_command(state, &format!("eval {code}"))?;
+    if response.trim() != "ok" {
+        return Err(format!("compositor rejected viewport: {}", response.trim()));
     }
     Ok(())
 }
@@ -1053,9 +1047,8 @@ fn viewport_matches(monitors: &serde_json::Value, output: &str, viewport: &Viewp
 }
 
 fn read_monitors(state: &SessionState) -> Result<serde_json::Value, String> {
-    let bytes = hyprctl_output(state, [OsString::from("monitors"), OsString::from("-j")])?;
-    serde_json::from_slice(&bytes)
-        .map_err(|error| format!("hyprctl returned invalid monitor JSON: {error}"))
+    serde_json::from_str(&compositor_query(state, "monitors")?)
+        .map_err(|error| format!("compositor returned invalid monitor JSON: {error}"))
 }
 
 fn output_name(state: &SessionState) -> Result<String, String> {
@@ -1349,9 +1342,9 @@ fn app_present(state: &SessionState) -> bool {
 }
 
 fn window_count(state: &SessionState) -> Result<usize, String> {
-    let bytes = hyprctl_output(state, [OsString::from("clients"), OsString::from("-j")])?;
-    let clients: Vec<serde_json::Value> = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("hyprctl returned invalid client JSON: {error}"))?;
+    let clients = compositor_query(state, "clients")?;
+    let clients: Vec<serde_json::Value> = serde_json::from_str(&clients)
+        .map_err(|error| format!("compositor returned invalid client JSON: {error}"))?;
     Ok(clients.len())
 }
 
@@ -1387,39 +1380,19 @@ fn meaningful_app_log_line(line: &str) -> bool {
         && !NOISE.iter().any(|noise| line.contains(noise))
 }
 
-fn hyprctl_output<I>(state: &SessionState, arguments: I) -> Result<Vec<u8>, String>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let output = hyprctl_command(state)?
-        .args(arguments)
-        .output()
-        .map_err(|error| format!("could not execute session hyprctl: {error}"))?;
-    if output.status.success() {
-        Ok(output.stdout)
-    } else {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!(
-            "session hyprctl failed: {}{}{}",
-            stdout.trim(),
-            if !stdout.trim().is_empty() && !stderr.trim().is_empty() {
-                ": "
-            } else {
-                ""
-            },
-            stderr.trim()
-        ))
-    }
+fn compositor_command(state: &SessionState, command: &str) -> Result<String, String> {
+    session_compositor(state)?
+        .command(command, COMPOSITOR_TIMEOUT)
+        .map_err(|error| format!("session compositor request failed: {error}"))
 }
 
-fn hyprctl_command(state: &SessionState) -> Result<Command, String> {
-    let prefix = state.buildroot.join("prefix");
-    let mut library_path = OsString::from(prefix.join("lib"));
-    if let Some(existing) = env::var_os("LD_LIBRARY_PATH") {
-        library_path.push(":");
-        library_path.push(existing);
-    }
+fn compositor_query(state: &SessionState, query: &str) -> Result<String, String> {
+    session_compositor(state)?
+        .query_json(query, COMPOSITOR_TIMEOUT)
+        .map_err(|error| format!("session compositor query failed: {error}"))
+}
+
+fn session_compositor(state: &SessionState) -> Result<Compositor, String> {
     let instance_path = state.runroot.join("instance");
     let instance = fs::read_to_string(&instance_path).map_err(|e| {
         format!(
@@ -1427,14 +1400,7 @@ fn hyprctl_command(state: &SessionState) -> Result<Command, String> {
             instance_path.display()
         )
     })?;
-    let mut command = Command::new(
-        enzremote_webrtc_ipc::layout::hyprctl(&state.buildroot),
-    );
-    command
-        .arg("--instance")
-        .arg(instance.trim())
-        .env("LD_LIBRARY_PATH", library_path);
-    Ok(command)
+    Compositor::for_instance(instance.trim()).map_err(|error| error.to_string())
 }
 
 /// Render a Hyprland configuration file for a headless session viewport.

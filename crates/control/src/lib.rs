@@ -436,9 +436,8 @@ pub fn parse_control_message(message: &str) -> Result<ControlMessage, String> {
             if window_address.is_empty() || window_address.len() > 256 {
                 return Err("window_address must be 1-256 characters".into());
             }
-            // Hyprland addresses are hex like "0x56789abc".  We allow
-            // `0x` prefix followed by hex digits, or plain hex digits,
-            // to prevent any special-character abuse against hyprctl.
+            // The address is interpolated into a compositor Lua request, so only
+            // hex digits with an optional `0x` prefix are accepted.
             let hex_part = window_address
                 .strip_prefix("0x")
                 .or_else(|| window_address.strip_prefix("0X"))
