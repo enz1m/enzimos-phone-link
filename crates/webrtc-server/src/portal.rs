@@ -42,14 +42,32 @@ impl PortalCapture {
         control
             .set_read_timeout(Some(timeout))
             .map_err(|e| e.to_string())?;
-        let child = Command::new(helper)
-            .env("ENZREMOTE_PORTAL_RUNTIME_DIR", runtime.path())
-            .stdin(Stdio::from(OwnedFd::from(child_control)))
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .process_group(0)
-            .spawn()
-            .map_err(|e| format!("Could not launch private portal helper: {e}"))?;
+        let child_control = OwnedFd::from(child_control);
+        let mut attempts = 0;
+        let child = loop {
+            let stdin = child_control
+                .try_clone()
+                .map_err(|e| format!("Could not launch private portal helper: {e}"))?;
+            match Command::new(helper)
+                .env("ENZREMOTE_PORTAL_RUNTIME_DIR", runtime.path())
+                .stdin(Stdio::from(stdin))
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .process_group(0)
+                .spawn()
+            {
+                // A child forked elsewhere may briefly hold a just-written helper open for
+                // writing until it execs; exec then fails with "text file busy".
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 20 => {
+                    attempts += 1;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                result => {
+                    break result.map_err(|e| format!("Could not launch private portal helper: {e}"))?;
+                }
+            }
+        };
+        drop(child_control);
         let mut capture = Self {
             helper: child,
             control,
