@@ -13,11 +13,11 @@ publish = false
 unsafe_code = "forbid"
 
 [workspace.dependencies]
-enzui-security = { git = "https://github.com/enz1m/enzui.git", tag = "v0.3.0-alpha.1" }
-enzui-core = { git = "https://github.com/enz1m/enzui.git", tag = "v0.3.0-alpha.1" }
-enzui-widgets = { git = "https://github.com/enz1m/enzui.git", tag = "v0.3.0-alpha.1" }
-enzui-theme = { git = "https://github.com/enz1m/enzui.git", tag = "v0.3.0-alpha.1" }
-iced = { git = "https://github.com/enz1m/enzim-iced.git", rev = "e36b07b591661fdb666088fc943cc0b927a2367b", default-features = true, features = ["tokio", "a11y", "image-without-codecs"] }
+enzui-security = { git = "https://github.com/enz1m/enzui.git", rev = "46648f263fbfd31bb2a6327c4dda4845f8d5af97" }
+enzui-core = { git = "https://github.com/enz1m/enzui.git", rev = "46648f263fbfd31bb2a6327c4dda4845f8d5af97" }
+enzui-widgets = { git = "https://github.com/enz1m/enzui.git", rev = "46648f263fbfd31bb2a6327c4dda4845f8d5af97" }
+enzui-theme = { git = "https://github.com/enz1m/enzui.git", rev = "46648f263fbfd31bb2a6327c4dda4845f8d5af97" }
+iced = { git = "https://github.com/enz1m/enzim-iced.git", rev = "58b66f27b82d30cb0fd09db524307b6a0e099279", default-features = true, features = ["tokio", "a11y", "image-without-codecs"] }
 gst-app = { package = "gstreamer-app", version = "0.24.5", features = ["v1_28"] }
 gst-video = { package = "gstreamer-video", version = "0.24.5", features = ["v1_28"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -46,7 +46,7 @@ incremental = false
 
 # Match the patches at the SDK workspace root.
 [patch.crates-io]
-winit = { git = "https://github.com/enz1m/enzim-winit.git", rev = "40eeb41f8637ef1620afa377ba006874224b6d65" }
+winit = { git = "https://github.com/enz1m/enzim-winit.git", rev = "405e1caca89357f6da20eafe7ed8abc686567092" }
 zbus = { git = "https://github.com/enz1m/enzim-zbus.git", rev = "e182645b56d15e637bb6c8144f99ebfa7f900716" }
 zbus_macros = { git = "https://github.com/enz1m/enzim-zbus.git", rev = "e182645b56d15e637bb6c8144f99ebfa7f900716" }
 zbus_names = { git = "https://github.com/enz1m/enzim-zbus.git", rev = "e182645b56d15e637bb6c8144f99ebfa7f900716" }
